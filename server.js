@@ -14,11 +14,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicPath = path.join(__dirname, 'public');
 const PORT = process.env.PORT || 7860;
 
-console.log('[boot] public/ exists:', fs.existsSync(publicPath));
-if (fs.existsSync(publicPath)) {
-  console.log('[boot] public/ contents:', fs.readdirSync(publicPath));
-}
-
 const app = express();
 
 app.use(cors({
@@ -29,14 +24,30 @@ app.use(cors({
   credentials: false,
 }));
 
+// ── DIAGNOSTIC — delete this route once dashboard works ─
+app.get('/debug', (_req, res) => {
+  const info = {
+    __dirname,
+    publicPath,
+    publicExists: fs.existsSync(publicPath),
+    publicContents: [],
+    rootContents: [],
+    srcContents: [],
+  };
+
+  try { info.rootContents = fs.readdirSync(__dirname); } catch (e) { info.rootContents = e.message; }
+  try { info.publicContents = fs.readdirSync(publicPath); } catch (e) { info.publicContents = e.message; }
+  try { info.srcContents = fs.readdirSync(path.join(__dirname, 'src')); } catch (e) { info.srcContents = e.message; }
+
+  res.json(info);
+});
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// static files FIRST — this serves index.html, style.css, app.js
 app.use(express.static(publicPath));
 
-// body parser for non-GET requests
 app.use((req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
     return next();
@@ -49,12 +60,10 @@ app.use((req, res, next) => {
 
 app.use(trackRequest);
 
-// dashboard API
 app.use('/api/providers', providersRouter);
 app.use('/api/models', modelsRouter);
 app.use('/api/stats', statsRouter);
 
-// aggregated models
 app.get('/v1/models', async (_req, res) => {
   try {
     const models = await getAggregatedModels();
@@ -64,7 +73,6 @@ app.get('/v1/models', async (_req, res) => {
   }
 });
 
-// SPA fallback — any GET that isn't /api or /v1 serves index.html
 app.get('*', (req, res, next) => {
   if (/^\/v\d+\//.test(req.path) || req.path.startsWith('/api/')) {
     return next();
@@ -73,16 +81,13 @@ app.get('*', (req, res, next) => {
   if (fs.existsSync(indexFile)) {
     return res.sendFile(indexFile);
   }
-  res.status(404).send('Dashboard not found');
+  res.status(404).json({ error: 'index.html not found', publicPath, exists: fs.existsSync(publicPath) });
 });
 
-// proxy catches POST/PUT/PATCH etc — MUST be last
 app.all('*', handleProxy);
 
-// boot
 try {
   await initStorage();
-  console.log('[boot] Storage initialized');
 } catch (e) {
   console.error('[boot] Storage init error:', e.message);
 }
