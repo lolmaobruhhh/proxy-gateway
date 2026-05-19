@@ -11,8 +11,8 @@
   --success: #34d399;
   --warning: #fbbf24;
   --radius: 12px;
-  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --mono: 'Courier New', monospace;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -31,7 +31,6 @@ body {
   padding: 1rem;
 }
 
-/* ── header ────────────────────────────────── */
 .header {
   display: flex;
   align-items: center;
@@ -46,13 +45,7 @@ body {
 .logo {
   font-size: 1.4rem;
   font-weight: 700;
-  letter-spacing: -0.02em;
-}
-
-.logo span {
-  background: linear-gradient(135deg, var(--accent), #c084fc);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: var(--accent);
 }
 
 .tabs {
@@ -78,7 +71,6 @@ body {
 .tab:hover { color: var(--text); background: var(--surface-hover); }
 .tab.active { color: var(--text); background: var(--accent-glow); box-shadow: 0 0 0 1px var(--accent); }
 
-/* ── tab panels ────────────────────────────── */
 .tab-panel { display: none; }
 .tab-panel.active { display: block; animation: fadeIn 0.25s ease; }
 
@@ -87,13 +79,11 @@ body {
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* ── card ──────────────────────────────────── */
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1.5rem;
-  backdrop-filter: blur(20px);
 }
 
 .card h2 {
@@ -108,7 +98,6 @@ body {
   color: var(--text-dim);
 }
 
-/* ── forms ─────────────────────────────────── */
 .form-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -173,11 +162,8 @@ textarea {
   line-height: 1.5;
 }
 
-select {
-  cursor: pointer;
-}
+select { cursor: pointer; }
 
-/* ── buttons ───────────────────────────────── */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -194,25 +180,13 @@ select {
 }
 
 .btn:hover { background: var(--surface-hover); }
-
-.btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
-
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.primary:hover { opacity: 0.9; }
-
 .btn.danger { background: rgba(248,113,113,0.15); border-color: var(--danger); color: var(--danger); }
 .btn.danger:hover { background: rgba(248,113,113,0.25); }
-
 .btn.small { padding: 0.35rem 0.75rem; font-size: 0.8rem; }
 
-/* ── providers grid ────────────────────────── */
-.providers-grid {
-  display: grid;
-  gap: 0.75rem;
-}
+.providers-grid { display: grid; gap: 0.75rem; }
 
 .provider-card {
   display: flex;
@@ -231,10 +205,7 @@ select {
   background: var(--accent-glow);
 }
 
-.provider-info h4 {
-  font-size: 1rem;
-  font-weight: 600;
-}
+.provider-info h4 { font-size: 1rem; font-weight: 600; }
 
 .provider-info .prefix-badge {
   display: inline-block;
@@ -258,7 +229,6 @@ select {
   gap: 0.5rem;
 }
 
-/* ── modal ─────────────────────────────────── */
 .modal {
   position: fixed;
   inset: 0;
@@ -307,7 +277,6 @@ select {
   margin-top: 1rem;
 }
 
-/* ── models ────────────────────────────────── */
 .models-toolbar {
   display: flex;
   gap: 1rem;
@@ -346,7 +315,6 @@ select {
   color: var(--text);
 }
 
-/* ── stats ─────────────────────────────────── */
 .stats-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -401,7 +369,6 @@ select {
 
 .stat-provider-row .sp-stats span { color: var(--text); font-weight: 600; }
 
-/* ── detail view ───────────────────────────── */
 .detail-section {
   margin-bottom: 1.25rem;
 }
@@ -452,7 +419,6 @@ select {
   font-weight: 600;
 }
 
-/* ── toast ─────────────────────────────────── */
 #toasts {
   position: fixed;
   bottom: 1.5rem;
@@ -481,7 +447,6 @@ select {
   to { opacity: 1; transform: translateX(0); }
 }
 
-/* ── responsive ────────────────────────────── */
 @media (max-width: 640px) {
   .form-row { grid-template-columns: 1fr; }
   .header { flex-direction: column; align-items: flex-start; }
