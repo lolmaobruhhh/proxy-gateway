@@ -3,11 +3,9 @@ import { getStats, recordRequest as _record } from './storage.js';
 
 export const statsRouter = Router();
 
-// active sessions — in-memory only
-const activeSessions = new Map(); // ip → lastSeen timestamp
-const ACTIVE_WINDOW = 60_000; // 60 seconds
+const activeSessions = new Map();
+const ACTIVE_WINDOW = 60_000;
 
-// clean up stale sessions every 15 s
 setInterval(() => {
   const now = Date.now();
   for (const [ip, ts] of activeSessions) {
@@ -15,24 +13,20 @@ setInterval(() => {
   }
 }, 15_000);
 
-// ── middleware ───────────────────────────────────────────
 export function trackRequest(req, _res, next) {
-  // skip dashboard API and static files
-  if (req.path.startsWith('/api/') || req.path === '/v1/models') return next();
-  if (req.method === 'GET' && (req.path === '/' || req.path.endsWith('.html') || req.path.endsWith('.css') || req.path.endsWith('.js') || req.path.endsWith('.ico'))) return next();
+  if (req.path.startsWith('/api/') || req.path === '/v1/models' || req.path === '/health') return next();
+  if (req.method === 'GET') return next();
 
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
   activeSessions.set(ip, Date.now());
-
   next();
 }
 
-// record a completed proxy request (called from proxy.js)
 export function recordProxyRequest(prefix, ip, errored = false) {
   _record(prefix, ip, errored);
+  activeSessions.set(ip, Date.now());
 }
 
-// ── routes ───────────────────────────────────────────────
 statsRouter.get('/', (_req, res) => {
   const stats = getStats();
   const now = Date.now();
