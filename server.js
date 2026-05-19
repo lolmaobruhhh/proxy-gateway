@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import fs from 'fs';
 
 import { initStorage } from './src/storage.js';
 import { providersRouter } from './src/providers.js';
@@ -10,10 +11,16 @@ import { statsRouter, trackRequest } from './src/stats.js';
 import { handleProxy } from './src/proxy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
+const publicPath = path.join(__dirname, 'public');
 const PORT = process.env.PORT || 7860;
 
-// ── middleware ──────────────────────────────────────────
+console.log('[boot] public/ exists:', fs.existsSync(publicPath));
+if (fs.existsSync(publicPath)) {
+  console.log('[boot] public/ contents:', fs.readdirSync(publicPath));
+}
+
+const app = express();
+
 app.use(cors({
   origin: '*',
   methods: '*',
@@ -22,33 +29,32 @@ app.use(cors({
   credentials: false,
 }));
 
-app.use((req, res, next) => {
-  // raw body capture for non-JSON passthrough later if needed
-  if (req.path.startsWith('/api/') || req.path === '/v1/models') {
-    express.json({ limit: '50mb' })(req, res, next);
-  } else {
-    express.json({ limit: '50mb' })(req, res, (err) => {
-      if (err) {
-        // body isn't JSON – store raw
-        req.body = null;
-      }
-      next();
-    });
-  }
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// serve dashboard
-app.use(express.static(path.join(__dirname, 'public')));
+// static files FIRST — this serves index.html, style.css, app.js
+app.use(express.static(publicPath));
 
-// request tracking
+// body parser for non-GET requests
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    return next();
+  }
+  express.json({ limit: '50mb' })(req, res, (err) => {
+    if (err) req.body = {};
+    next();
+  });
+});
+
 app.use(trackRequest);
 
-// ── dashboard API routes ────────────────────────────────
+// dashboard API
 app.use('/api/providers', providersRouter);
 app.use('/api/models', modelsRouter);
 app.use('/api/stats', statsRouter);
 
-// ── aggregated /v1/models endpoint ──────────────────────
+// aggregated models
 app.get('/v1/models', async (_req, res) => {
   try {
     const models = await getAggregatedModels();
@@ -58,11 +64,28 @@ app.get('/v1/models', async (_req, res) => {
   }
 });
 
-// ── wildcard proxy (must be last) ───────────────────────
-app.all(/^\/(?!api\/)(?!v1\/models$).*/, handleProxy);
+// SPA fallback — any GET that isn't /api or /v1 serves index.html
+app.get('*', (req, res, next) => {
+  if (/^\/v\d+\//.test(req.path) || req.path.startsWith('/api/')) {
+    return next();
+  }
+  const indexFile = path.join(publicPath, 'index.html');
+  if (fs.existsSync(indexFile)) {
+    return res.sendFile(indexFile);
+  }
+  res.status(404).send('Dashboard not found');
+});
 
-// ── boot ────────────────────────────────────────────────
-await initStorage();
+// proxy catches POST/PUT/PATCH etc — MUST be last
+app.all('*', handleProxy);
+
+// boot
+try {
+  await initStorage();
+  console.log('[boot] Storage initialized');
+} catch (e) {
+  console.error('[boot] Storage init error:', e.message);
+}
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`⚡ Proxy Gateway live on :${PORT}`);
