@@ -1,17 +1,15 @@
 FROM node:20-slim
 
-RUN useradd -m -u 1000 appuser
-
 WORKDIR /app
+
+RUN mkdir -p /data && chmod 777 /data
 
 COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY . .
 
-RUN mkdir -p /data && chown -R appuser:appuser /data /app
-
-USER appuser
+RUN chmod -R 755 /app
 
 EXPOSE 7860
 
