@@ -1,38 +1,65 @@
 import { Router } from 'express';
-import { getStats, recordRequest as _record } from './storage.js';
+import { getStats, recordRequest as _record, getProvider } from './storage.js';
 
-export const statsRouter = Router();
+export var statsRouter = Router();
 
-const activeSessions = new Map();
-const ACTIVE_WINDOW = 60_000;
+var activeSessions = new Map();
+var ACTIVE_WINDOW = 60000;
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, ts] of activeSessions) {
-    if (now - ts > ACTIVE_WINDOW) activeSessions.delete(ip);
+setInterval(function() {
+  var now = Date.now();
+  for (var entry of activeSessions) {
+    if (now - entry[1] > ACTIVE_WINDOW) activeSessions.delete(entry[0]);
   }
-}, 15_000);
+}, 15000);
 
 export function trackRequest(req, _res, next) {
   if (req.path.startsWith('/api/') || req.path === '/v1/models' || req.path === '/health') return next();
   if (req.method === 'GET') return next();
 
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
+  var ip = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.socket ? req.socket.remoteAddress : 'unknown') || 'unknown';
   activeSessions.set(ip, Date.now());
   next();
 }
 
-export function recordProxyRequest(prefix, ip, errored = false) {
+export function recordProxyRequest(prefix, ip, errored) {
+  errored = errored || false;
   _record(prefix, ip, errored);
   activeSessions.set(ip, Date.now());
 }
 
-statsRouter.get('/', (_req, res) => {
-  const stats = getStats();
-  const now = Date.now();
-  let activeCount = 0;
-  for (const [, ts] of activeSessions) {
-    if (now - ts <= ACTIVE_WINDOW) activeCount++;
+statsRouter.get('/', function(_req, res) {
+  var stats = getStats();
+  var now = Date.now();
+  var activeCount = 0;
+  for (var entry of activeSessions) {
+    if (now - entry[1] <= ACTIVE_WINDOW) activeCount++;
+  }
+
+  // Aggregate cloaked provider stats under "cloaked" label
+  var visibleProviders = {};
+  var cloakedAggregate = { requests: 0, errors: 0, uniqueUsers: 0 };
+  var hasCloaked = false;
+
+  for (var key in stats.providers) {
+    var prov = getProvider(key);
+    var s = stats.providers[key];
+    if (prov && prov.cloaked) {
+      hasCloaked = true;
+      cloakedAggregate.requests += s.requests;
+      cloakedAggregate.errors += s.errors;
+      cloakedAggregate.uniqueUsers += (s.uniqueIps ? s.uniqueIps.length : 0);
+    } else {
+      visibleProviders[key] = {
+        requests: s.requests,
+        errors: s.errors,
+        uniqueUsers: s.uniqueIps ? s.uniqueIps.length : 0,
+      };
+    }
+  }
+
+  if (hasCloaked) {
+    visibleProviders['cloaked'] = cloakedAggregate;
   }
 
   res.json({
@@ -40,12 +67,6 @@ statsRouter.get('/', (_req, res) => {
     totalErrors: stats.totalErrors,
     totalUniqueUsers: stats.uniqueIps.length,
     activeNow: activeCount,
-    providers: Object.fromEntries(
-      Object.entries(stats.providers).map(([k, v]) => [k, {
-        requests: v.requests,
-        errors: v.errors,
-        uniqueUsers: v.uniqueIps.length,
-      }])
-    ),
+    providers: visibleProviders,
   });
 });
