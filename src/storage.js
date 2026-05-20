@@ -1,15 +1,15 @@
 import fs from 'fs/promises';
 import path from 'path';
 
-const DATA = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+var DATA = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 
-const FILES = {
+var FILES = {
   providers: path.join(DATA, 'providers.json'),
   stats: path.join(DATA, 'stats.json'),
   history: path.join(DATA, 'history.json'),
 };
 
-const defaults = {
+var defaults = {
   providers: {},
   stats: {
     totalRequests: 0,
@@ -20,8 +20,7 @@ const defaults = {
   history: {},
 };
 
-// in-memory cache
-let cache = {
+var cache = {
   providers: null,
   stats: null,
   history: null,
@@ -29,52 +28,94 @@ let cache = {
 
 export async function initStorage() {
   await fs.mkdir(DATA, { recursive: true });
+  console.log('[storage] data dir:', DATA);
 
-  for (const [key, filePath] of Object.entries(FILES)) {
+  for (var key in FILES) {
     try {
-      const raw = await fs.readFile(filePath, 'utf-8');
+      var raw = await fs.readFile(FILES[key], 'utf-8');
       cache[key] = JSON.parse(raw);
-    } catch {
-      cache[key] = structuredClone(defaults[key]);
+      console.log('[storage] loaded ' + key + ' from disk');
+    } catch (e) {
+      cache[key] = JSON.parse(JSON.stringify(defaults[key]));
       await persist(key);
+      console.log('[storage] created default ' + key);
     }
   }
 
-  // auto-persist stats every 30 s
-  setInterval(() => persist('stats'), 30_000);
+  setInterval(function() { persist('stats'); }, 30000);
 }
 
 async function persist(key) {
   try {
     await fs.writeFile(FILES[key], JSON.stringify(cache[key], null, 2), 'utf-8');
   } catch (e) {
-    console.error(`[storage] failed to persist ${key}:`, e.message);
+    console.error('[storage] persist ' + key + ' failed:', e.message);
   }
 }
 
-// ── providers ──────────────────────────────────────────
 export function getAllProviders() {
-  return cache.providers;
+  return cache.providers || {};
 }
 
 export function getProvider(prefix) {
-  return cache.providers[prefix] || null;
+  return (cache.providers || {})[prefix] || null;
+}
+
+// get visible (non-cloaked) providers only
+export function getVisibleProviders() {
+  var result = {};
+  var all = cache.providers || {};
+  for (var key in all) {
+    if (!all[key].cloaked) {
+      result[key] = all[key];
+    }
+  }
+  return result;
+}
+
+// get cloaked providers (name only, no sensitive data)
+export function getCloakedProvidersList() {
+  var result = [];
+  var all = cache.providers || {};
+  for (var key in all) {
+    if (all[key].cloaked) {
+      result.push({
+        prefix: key,
+        cloak_name: all[key].cloak_name || 'Unnamed',
+      });
+    }
+  }
+  return result;
 }
 
 export async function addProvider(provider) {
-  const { prefix } = provider;
+  var prefix = provider.prefix;
   if (cache.providers[prefix]) {
-    return { ok: false, reason: `Prefix "${prefix}" already exists. Pick another.` };
+    return { ok: false, reason: 'Prefix "' + prefix + '" already exists. Pick another.' };
   }
-  cache.providers[prefix] = { ...provider, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+
+  // Ensure new fields have defaults
+  provider.cloaked = provider.cloaked || false;
+  provider.cloak_name = provider.cloak_name || '';
+  provider.cloak_password = provider.cloak_password || '';
+  provider.think_config = provider.think_config || null;
+  provider.search_config = provider.search_config || null;
+  provider.sandbox_code = provider.sandbox_code || null;
+
+  cache.providers[prefix] = Object.assign({}, provider, {
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
   await persist('providers');
 
-  // init history
   if (!cache.history[prefix]) cache.history[prefix] = [];
-  cache.history[prefix].push({ timestamp: new Date().toISOString(), action: 'created', snapshot: structuredClone(provider) });
+  cache.history[prefix].push({
+    timestamp: new Date().toISOString(),
+    action: 'created',
+    snapshot: JSON.parse(JSON.stringify(provider)),
+  });
   await persist('history');
 
-  // init stats bucket
   if (!cache.stats.providers[prefix]) {
     cache.stats.providers[prefix] = { requests: 0, errors: 0, uniqueIps: [] };
   }
@@ -84,68 +125,90 @@ export async function addProvider(provider) {
 }
 
 export async function updateProvider(prefix, updates) {
-  const existing = cache.providers[prefix];
-  if (!existing) return { ok: false, reason: `Provider "${prefix}" not found.` };
+  var existing = cache.providers[prefix];
+  if (!existing) return { ok: false, reason: 'Provider "' + prefix + '" not found.' };
 
-  const changes = {};
-  for (const [k, v] of Object.entries(updates)) {
-    if (JSON.stringify(existing[k]) !== JSON.stringify(v)) {
-      changes[k] = { from: existing[k], to: v };
-      existing[k] = v;
+  var changes = {};
+  for (var k in updates) {
+    if (JSON.stringify(existing[k]) !== JSON.stringify(updates[k])) {
+      changes[k] = { from: existing[k], to: updates[k] };
+      existing[k] = updates[k];
     }
   }
   existing.updated_at = new Date().toISOString();
   await persist('providers');
 
   cache.history[prefix] = cache.history[prefix] || [];
-  cache.history[prefix].push({ timestamp: new Date().toISOString(), action: 'edited', changes });
+  cache.history[prefix].push({
+    timestamp: new Date().toISOString(),
+    action: 'edited',
+    changes: changes,
+  });
   await persist('history');
 
-  return { ok: true, changes };
+  return { ok: true, changes: changes };
 }
 
 export async function deleteProvider(prefix) {
-  if (!cache.providers[prefix]) return { ok: false, reason: `Provider "${prefix}" not found.` };
+  if (!cache.providers[prefix]) return { ok: false, reason: 'Provider "' + prefix + '" not found.' };
   delete cache.providers[prefix];
   await persist('providers');
   return { ok: true };
 }
 
+export async function cloakProvider(prefix, cloak_name, cloak_password) {
+  var p = cache.providers[prefix];
+  if (!p) return { ok: false, reason: 'Provider not found.' };
+  p.cloaked = true;
+  p.cloak_name = cloak_name || p.name || 'Unnamed';
+  p.cloak_password = cloak_password;
+  p.updated_at = new Date().toISOString();
+  await persist('providers');
+  return { ok: true };
+}
+
+export async function uncloakProvider(prefix) {
+  var p = cache.providers[prefix];
+  if (!p) return { ok: false, reason: 'Provider not found.' };
+  p.cloaked = false;
+  p.updated_at = new Date().toISOString();
+  await persist('providers');
+  return { ok: true };
+}
+
 export function getHistory(prefix) {
-  return cache.history[prefix] || [];
+  return (cache.history || {})[prefix] || [];
 }
 
-// ── stats ──────────────────────────────────────────────
 export function getStats() {
-  return cache.stats;
+  return cache.stats || defaults.stats;
 }
 
-export function recordRequest(prefix, ip, errored = false) {
+export function recordRequest(prefix, ip, errored) {
+  errored = errored || false;
   cache.stats.totalRequests++;
   if (errored) cache.stats.totalErrors++;
-
-  if (!cache.stats.uniqueIps.includes(ip)) cache.stats.uniqueIps.push(ip);
+  if (cache.stats.uniqueIps.indexOf(ip) === -1) cache.stats.uniqueIps.push(ip);
 
   if (prefix) {
     if (!cache.stats.providers[prefix]) {
       cache.stats.providers[prefix] = { requests: 0, errors: 0, uniqueIps: [] };
     }
-    const p = cache.stats.providers[prefix];
+    var p = cache.stats.providers[prefix];
     p.requests++;
     if (errored) p.errors++;
-    if (!p.uniqueIps.includes(ip)) p.uniqueIps.push(ip);
+    if (p.uniqueIps.indexOf(ip) === -1) p.uniqueIps.push(ip);
   }
 }
 
-// ── models cache (in-memory only, fetched on demand) ───
-let modelsCache = {}; // { prefix: { models: [], fetchedAt: timestamp } }
+var modelsCache = {};
 
 export function getCachedModels(prefix) {
   return modelsCache[prefix] || null;
 }
 
 export function setCachedModels(prefix, models) {
-  modelsCache[prefix] = { models, fetchedAt: Date.now() };
+  modelsCache[prefix] = { models: models, fetchedAt: Date.now() };
 }
 
 export function getAllCachedModels() {
