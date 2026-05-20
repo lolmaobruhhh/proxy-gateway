@@ -6,24 +6,7 @@ import { recordProxyRequest } from './stats.js';
 export async function handleProxy(req, res) {
   var ip = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.socket ? req.socket.remoteAddress : 'unknown') || 'unknown';
 
-  // ── DEBUG LOGGING ─────────────────────────────────────
   var body = req.body || {};
-  var msgCount = Array.isArray(body.messages) ? body.messages.length : 0;
-  var bodyKeys = Object.keys(body);
-  console.log('[proxy] incoming:', req.method, req.path);
-  console.log('[proxy] body keys:', bodyKeys.join(', '));
-  console.log('[proxy] model:', body.model || 'MISSING');
-  console.log('[proxy] messages count:', msgCount);
-  console.log('[proxy] stream:', body.stream);
-  if (msgCount > 0) {
-    console.log('[proxy] first msg role:', body.messages[0].role);
-    console.log('[proxy] last msg role:', body.messages[msgCount - 1].role);
-    console.log('[proxy] last msg content (first 100 chars):', String(body.messages[msgCount - 1].content || '').slice(0, 100));
-  }
-  if (bodyKeys.length === 0) {
-    console.log('[proxy] WARNING: body is empty! req.headers content-type:', req.headers['content-type']);
-  }
-
   var modelRaw = body.model || '';
   var colonIdx = modelRaw.indexOf(':');
 
@@ -33,7 +16,6 @@ export async function handleProxy(req, res) {
       error: {
         message: 'Model field must include a provider prefix, e.g. "opn:gpt-4o"',
         type: 'proxy_error',
-        debug: { bodyKeys: bodyKeys, msgCount: msgCount, contentType: req.headers['content-type'] || 'none' }
       }
     });
   }
@@ -70,16 +52,9 @@ export async function handleProxy(req, res) {
     });
   }
 
-  var transformed = transformRequest(body, provider, strippedModel, req.path);
+  // Transform with full cascade (features → sandbox code → configs → template)
+  var transformed = transformRequest(body, provider, strippedModel, req.path, req.headers);
   var clientWantsStream = body.stream === true;
-
-  // ── DEBUG: log what we're about to send ───────────────
-  var tMsgCount = Array.isArray(transformed.body.messages) ? transformed.body.messages.length : 0;
-  console.log('[proxy] transformed model:', transformed.body.model);
-  console.log('[proxy] transformed messages count:', tMsgCount);
-  console.log('[proxy] transformed url_path:', transformed.url_path);
-  console.log('[proxy] upstream URL:', provider.upstream_url + transformed.url_path);
-  console.log('[proxy] has sandbox:', !!provider.sandbox);
 
   var skipped = new Set();
   var lastError = null;
@@ -101,24 +76,19 @@ export async function handleProxy(req, res) {
       };
 
       if (fetchOpts.method !== 'GET' && fetchOpts.method !== 'HEAD') {
-        var outBody = JSON.stringify(transformed.body);
-        fetchOpts.body = outBody;
-        console.log('[proxy] outgoing body length:', outBody.length, 'bytes');
+        fetchOpts.body = JSON.stringify(transformed.body);
       }
 
       var upstream = await fetch(upstreamUrl, fetchOpts);
 
-      console.log('[proxy] upstream responded:', upstream.status, upstream.headers.get('content-type'));
-
       if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429) {
         skipped.add(index);
         lastError = 'Key #' + (index + 1) + ' returned ' + upstream.status;
-        console.log('[proxy] key failed:', lastError);
         continue;
       }
 
       var contentType = upstream.headers.get('content-type') || '';
-      var isSSE = contentType.includes('text/event-stream');
+      var isSSE = contentType.indexOf('text/event-stream') !== -1;
 
       for (var pair of upstream.headers.entries()) {
         var hk = pair[0];
@@ -137,19 +107,17 @@ export async function handleProxy(req, res) {
 
         var reader = upstream.body.getReader();
         var decoder = new TextDecoder();
-
         try {
           while (true) {
             var chunk = await reader.read();
             if (chunk.done) break;
             res.write(decoder.decode(chunk.value, { stream: true }));
           }
-        } catch (streamErr) {
-          console.error('[proxy] stream error:', streamErr.message);
+        } catch (e) {
+          console.error('[proxy] stream error:', e.message);
         } finally {
           res.end();
         }
-
         recordProxyRequest(prefix, ip, upstream.status >= 400);
         return;
 
@@ -160,17 +128,14 @@ export async function handleProxy(req, res) {
         var rModel = strippedModel;
         var finishReason = 'stop';
         var responseId = '';
-
         try {
           var buffer = '';
           while (true) {
             var chunk2 = await reader2.read();
             if (chunk2.done) break;
             buffer += decoder2.decode(chunk2.value, { stream: true });
-
             var lines = buffer.split('\n');
             buffer = lines.pop() || '';
-
             for (var li = 0; li < lines.length; li++) {
               var line = lines[li];
               if (line.indexOf('data: ') !== 0) continue;
@@ -188,10 +153,10 @@ export async function handleProxy(req, res) {
                 if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) {
                   finishReason = parsed.choices[0].finish_reason;
                 }
-              } catch (pe) { /* skip malformed */ }
+              } catch (pe) {}
             }
           }
-        } catch (bufErr) { /* stream error during buffering */ }
+        } catch (bufErr) {}
 
         res.setHeader('content-type', 'application/json');
         res.json({
@@ -199,27 +164,20 @@ export async function handleProxy(req, res) {
           object: 'chat.completion',
           created: Math.floor(Date.now() / 1000),
           model: prefix + ':' + rModel,
-          choices: [{
-            index: 0,
-            message: { role: 'assistant', content: fullContent },
-            finish_reason: finishReason,
-          }],
+          choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: finishReason }],
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         });
-
         recordProxyRequest(prefix, ip, upstream.status >= 400);
         return;
 
       } else {
         var responseBody = await upstream.text();
-        console.log('[proxy] non-stream response length:', responseBody.length);
         res.send(responseBody);
         recordProxyRequest(prefix, ip, upstream.status >= 400);
         return;
       }
 
     } catch (fetchErr) {
-      console.error('[proxy] fetch error:', fetchErr.message);
       skipped.add(index);
       lastError = fetchErr.message;
       continue;
