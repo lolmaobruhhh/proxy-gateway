@@ -37,7 +37,7 @@ Zero frontend modifications required. Zero provider logic hardcoded. Future-proo
 ### Railway / Render / Any VPS
 
 ```bash
-git clone https://github.com/YOUR_REPO/proxy-gateway.git
+git clone https://github.com/lolmaobruhhh/proxy-gateway.git
 cd proxy-gateway
 npm install
 node server.js
