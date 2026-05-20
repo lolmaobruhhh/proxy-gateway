@@ -3,11 +3,12 @@ import cors from 'cors';
 import { fileURLToPath } from 'url';
 import path from 'path';
 
-import { initStorage } from './src/storage.js';
+import { initStorage, getProvider } from './src/storage.js';
 import { providersRouter } from './src/providers.js';
 import { modelsRouter, getAggregatedModels } from './src/models.js';
 import { statsRouter, trackRequest } from './src/stats.js';
 import { handleProxy } from './src/proxy.js';
+import { transformRequest } from './src/transformer.js';
 
 var __dirname = path.dirname(fileURLToPath(import.meta.url));
 var PORT = process.env.PORT || 7860;
@@ -97,7 +98,7 @@ var css = [
   '@media(max-width:640px){.form-row{grid-template-columns:1fr}.header{flex-direction:column;align-items:flex-start}.stats-cards{grid-template-columns:1fr 1fr}}',
 ].join('\n');
 
-var html = [
+var htmlBody = [
   '<div class="app">',
   '<header class="header">',
   '<div class="logo">&#9889; Proxy Gateway</div>',
@@ -158,7 +159,7 @@ var html = [
   '</div>',
 ].join('\n');
 
-var js = [
+var jsCode = [
   'var API="";',
   '',
   'function esc(str){if(!str)return"";var d=document.createElement("div");d.textContent=String(str);return d.innerHTML;}',
@@ -389,7 +390,7 @@ var js = [
   'switchTab(initTab);',
 ].join('\n');
 
-var fullPage = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1.0">\n<title>Proxy Gateway</title>\n<style>\n' + css + '\n</style>\n</head>\n<body>\n' + html + '\n<script>\n' + js + '\n<\/script>\n</body>\n</html>';
+var fullPage = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1.0">\n<title>Proxy Gateway</title>\n<style>\n' + css + '\n</style>\n</head>\n<body>\n' + htmlBody + '\n<script>\n' + jsCode + '\n<\/script>\n</body>\n</html>';
 
 // ── SERVE DASHBOARD ─────────────────────────────────────
 app.get('/', function(_req, res) {
@@ -412,6 +413,49 @@ app.use(trackRequest);
 app.use('/api/providers', providersRouter);
 app.use('/api/models', modelsRouter);
 app.use('/api/stats', statsRouter);
+
+// ── DEBUG ENDPOINT ──────────────────────────────────────
+app.post('/api/debug-proxy', function(req, res) {
+  var body = req.body || {};
+  var modelRaw = body.model || '';
+  var colonIdx = modelRaw.indexOf(':');
+  var info = {
+    received: {
+      bodyKeys: Object.keys(body),
+      model: body.model || 'MISSING',
+      messageCount: Array.isArray(body.messages) ? body.messages.length : 0,
+      stream: body.stream,
+      contentType: req.headers['content-type'],
+      bodySize: JSON.stringify(body).length
+    }
+  };
+
+  if (colonIdx !== -1) {
+    var prefix = modelRaw.slice(0, colonIdx).toLowerCase();
+    var stripped = modelRaw.slice(colonIdx + 1);
+    var provider = getProvider(prefix);
+    info.parsed = { prefix: prefix, strippedModel: stripped, providerFound: !!provider };
+    if (provider) {
+      var transformed = transformRequest(body, provider, stripped, '/v1/chat/completions');
+      info.transformed = {
+        url_path: transformed.url_path,
+        headerKeys: Object.keys(transformed.headers),
+        bodyKeys: Object.keys(transformed.body),
+        transformedModel: transformed.body.model,
+        transformedMessageCount: Array.isArray(transformed.body.messages) ? transformed.body.messages.length : 0,
+        hasSandbox: !!provider.sandbox
+      };
+    }
+  }
+
+  if (Array.isArray(body.messages)) {
+    info.messages = body.messages.map(function(m, i) {
+      return { index: i, role: m.role, contentLength: (m.content || '').length };
+    });
+  }
+
+  res.json(info);
+});
 
 // aggregated models
 app.get('/v1/models', async function(_req, res) {
