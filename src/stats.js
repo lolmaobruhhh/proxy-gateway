@@ -36,7 +36,6 @@ statsRouter.get('/', function(_req, res) {
     if (now - entry[1] <= ACTIVE_WINDOW) activeCount++;
   }
 
-  // Aggregate cloaked provider stats under "cloaked" label
   var visibleProviders = {};
   var cloakedAggregate = { requests: 0, errors: 0, uniqueUsers: 0 };
   var hasCloaked = false;
