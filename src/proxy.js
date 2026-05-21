@@ -52,8 +52,8 @@ export async function handleProxy(req, res) {
     });
   }
 
-  // Transform with full cascade (features → sandbox code → configs → template)
-  var transformed = transformRequest(body, provider, strippedModel, req.path, req.headers);
+  // Transform — passes all 6 args including req.method
+  var transformed = transformRequest(body, provider, strippedModel, req.path, req.headers, req.method);
   var clientWantsStream = body.stream === true;
 
   var skipped = new Set();
@@ -66,16 +66,25 @@ export async function handleProxy(req, res) {
     var key = picked.key;
     var index = picked.index;
     var headers = injectKey(transformed.headers, key);
-    var upstreamUrl = provider.upstream_url + transformed.url_path;
+
+    // Build upstream URL
+    var upstreamUrl;
+    if (transformed.url) {
+      upstreamUrl = transformed.url.replace(/{{KEY}}/g, key);
+    } else {
+      upstreamUrl = provider.upstream_url + transformed.url_path;
+    }
+
+    var httpMethod = transformed.method || (req.method === 'GET' ? 'GET' : (req.method || 'POST'));
 
     try {
       var fetchOpts = {
-        method: req.method === 'GET' ? 'GET' : (req.method || 'POST'),
+        method: httpMethod,
         headers: headers,
         signal: AbortSignal.timeout(300000),
       };
 
-      if (fetchOpts.method !== 'GET' && fetchOpts.method !== 'HEAD') {
+      if (httpMethod !== 'GET' && httpMethod !== 'HEAD') {
         fetchOpts.body = JSON.stringify(transformed.body);
       }
 
