@@ -79,7 +79,7 @@ async function fetchModelsFromProvider(provider, key) {
   var allModels = [];
   var url = baseUrl;
   var page = 0;
-  var maxPages = 50; // safety limit
+  var maxPages = 50;
 
   while (url && page < maxPages) {
     var headers = { 'content-type': 'application/json' };
@@ -95,7 +95,6 @@ async function fetchModelsFromProvider(provider, key) {
       }
     }
 
-    // 60s timeout instead of 15s — large model lists (OpenRouter 300+) need time
     var resp = await fetch(url, {
       method: 'GET',
       headers: headers,
@@ -109,17 +108,13 @@ async function fetchModelsFromProvider(provider, key) {
 
     var json = await resp.json();
     var pageModels = extractModels(json);
-    
+
     for (var i = 0; i < pageModels.length; i++) {
       allModels.push(pageModels[i]);
     }
 
     console.log('[models] fetched page ' + page + ' from ' + provider.prefix + ': ' + pageModels.length + ' models (total: ' + allModels.length + ')');
 
-    // Check for pagination
-    // Some APIs use has_more + next_cursor
-    // Some use next_page_token
-    // Some use Link headers
     var nextUrl = null;
 
     if (json.has_more && json.next_cursor) {
@@ -132,7 +127,6 @@ async function fetchModelsFromProvider(provider, key) {
       nextUrl = json.pagination.next;
     }
 
-    // Check Link header for rel="next"
     if (!nextUrl) {
       var linkHeader = resp.headers.get('link') || '';
       var nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
@@ -154,7 +148,6 @@ async function fetchModelsFromProvider(provider, key) {
 }
 
 function extractModels(json) {
-  // OpenAI format: { data: [...] }
   if (Array.isArray(json.data)) {
     return json.data.map(function(m) {
       return {
@@ -164,13 +157,11 @@ function extractModels(json) {
       };
     });
   }
-  // Direct array
   if (Array.isArray(json)) {
     return json.map(function(m) {
       return typeof m === 'string' ? { id: m } : { id: m.id || m.name || String(m) };
     });
   }
-  // Try to find any array in the response
   for (var k in json) {
     var v = json[k];
     if (Array.isArray(v) && v.length > 0) {
