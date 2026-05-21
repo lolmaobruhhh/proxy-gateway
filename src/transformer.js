@@ -1,8 +1,8 @@
 import { parseFeatures, applyThinkConfig, applySearchConfig } from './features.js';
 import { runSandboxCode } from './sandboxRunner.js';
 
-export function transformRequest(incomingBody, provider, strippedModel, requestPath, reqHeaders) {
-  // 1. Parse and strip feature tags from messages
+export function transformRequest(incomingBody, provider, strippedModel, requestPath, reqHeaders, reqMethod) {
+  // 1. Parse and strip ALL [key=value] tags from messages
   var features = parseFeatures(incomingBody, reqHeaders);
   var hasFeatures = Object.keys(features).length > 0;
 
@@ -13,12 +13,34 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
   // 2. Run sandbox code if present
   var handled = {};
   var workingBody = JSON.parse(JSON.stringify(incomingBody));
+  var codeOverrides = {
+    url: null,
+    url_path: null,
+    headers: null,
+    method: null,
+  };
 
   if (provider.sandbox_code) {
-    var codeResult = runSandboxCode(provider.sandbox_code, workingBody, features, provider);
+    var requestContext = {
+      path: requestPath,
+      method: reqMethod || 'POST',
+      original_model: incomingBody.model || '',
+      stripped_model: strippedModel || '',
+    };
+
+    var codeResult = runSandboxCode(provider.sandbox_code, workingBody, features, provider, requestContext);
     workingBody = codeResult.body;
     handled = codeResult.handled;
+    codeOverrides.url = codeResult.url;
+    codeOverrides.url_path = codeResult.url_path;
+    codeOverrides.headers = codeResult.headers;
+    codeOverrides.method = codeResult.method;
+
     console.log('[transform] sandbox code handled:', JSON.stringify(handled));
+    if (codeOverrides.url) console.log('[transform] sandbox code override url:', codeOverrides.url);
+    if (codeOverrides.url_path) console.log('[transform] sandbox code override path:', codeOverrides.url_path);
+    if (codeOverrides.headers) console.log('[transform] sandbox code override headers:', JSON.stringify(Object.keys(codeOverrides.headers)));
+    if (codeOverrides.method) console.log('[transform] sandbox code override method:', codeOverrides.method);
   }
 
   // 3. Apply think_config for unhandled thinking
@@ -33,22 +55,31 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     console.log('[transform] applied search_config for:', features.search);
   }
 
-  // 5. Now apply sandbox JSON template or default passthrough
+  // 5. Apply sandbox JSON template or default passthrough
   var sandbox = provider.sandbox || null;
 
   if (!sandbox) {
     if (strippedModel) workingBody.model = strippedModel;
+
+    var defaultHeaders = buildDefaultHeaders(provider);
+    if (codeOverrides.headers) {
+      for (var hk in codeOverrides.headers) {
+        defaultHeaders[hk] = codeOverrides.headers[hk];
+      }
+    }
+
     return {
-      url_path: requestPath,
-      headers: buildDefaultHeaders(provider),
+      url: codeOverrides.url || null,
+      url_path: codeOverrides.url_path || requestPath,
+      headers: defaultHeaders,
       body: workingBody,
+      method: codeOverrides.method || null,
     };
   }
 
-  // Sandbox JSON present — transform structure
-  var urlPath = sandbox.url_path || requestPath;
+  // Sandbox JSON present
+  var urlPath = codeOverrides.url_path || sandbox.url_path || requestPath;
 
-  // Extract system message if needed
   var systemMsg = '';
   var nonSystemMessages = workingBody.messages || [];
   if (Array.isArray(nonSystemMessages)) {
@@ -68,11 +99,10 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     body = replacePlaceholders(body, {
       '{{MODEL}}': strippedModel || workingBody.model || '',
       '{{MESSAGES}}': workingBody.messages || [],
-      '{{SYSTEM}}': systemMsg,
+      '{{SYSTEM_MESSAGE}}': systemMsg,
       '{{NON_SYSTEM_MESSAGES}}': nonSystemMessages,
     });
 
-    // Merge extra fields from working body that aren't in template
     if (workingBody && typeof workingBody === 'object') {
       var templateKeys = Object.keys(body);
       for (var key in workingBody) {
@@ -87,14 +117,24 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     if (strippedModel) body.model = strippedModel;
   }
 
-  // Apply forced fields
   if (sandbox.forced_fields) {
     deepMerge(body, sandbox.forced_fields);
   }
 
   var headers = sandbox.headers ? JSON.parse(JSON.stringify(sandbox.headers)) : buildDefaultHeaders(provider);
+  if (codeOverrides.headers) {
+    for (var hk2 in codeOverrides.headers) {
+      headers[hk2] = codeOverrides.headers[hk2];
+    }
+  }
 
-  return { url_path: urlPath, headers: headers, body: body };
+  return {
+    url: codeOverrides.url || null,
+    url_path: urlPath,
+    headers: headers,
+    body: body,
+    method: codeOverrides.method || null,
+  };
 }
 
 export function injectKey(headers, key) {
