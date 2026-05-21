@@ -1,5 +1,5 @@
-// Parse [think=...] and [search=...] tags from messages and headers
-// Returns features object AND modifies body.messages in-place (strips tags)
+// Parse ALL [key=value] tags from messages and headers
+// Not just think/search — ANY tag. Sandbox code decides what they mean.
 
 export function parseFeatures(body, headers) {
   var features = {};
@@ -15,29 +15,26 @@ export function parseFeatures(body, headers) {
       var eqIdx = parts[i].indexOf('=');
       if (eqIdx === -1) continue;
       var key = parts[i].slice(0, eqIdx).trim().toLowerCase();
-      var val = parts[i].slice(eqIdx + 1).trim().toLowerCase();
-      if (key === 'think' || key === 'search') {
-        features[key] = val;
-      }
+      var val = parts[i].slice(eqIdx + 1).trim();
+      if (key) features[key] = val;
     }
   }
 
-  // 2. Scan messages for [think=...] and [search=...] tags
+  // 2. Scan messages for ALL [key=value] tags
   //    Message tags override header values
   if (body && Array.isArray(body.messages)) {
     for (var m = 0; m < body.messages.length; m++) {
       var msg = body.messages[m];
       if (typeof msg.content !== 'string') continue;
 
-      // Find all tags
-      var tagRegex = /\[(think|search)=([^\]]+)\]/gi;
+      var tagRegex = /\[([a-zA-Z_][a-zA-Z0-9_]*)=([^\]]+)\]/gi;
       var match;
       while ((match = tagRegex.exec(msg.content)) !== null) {
-        features[match[1].toLowerCase()] = match[2].trim().toLowerCase();
+        features[match[1].toLowerCase()] = match[2].trim();
       }
 
-      // Strip tags from content
-      body.messages[m].content = msg.content.replace(/\[(think|search)=[^\]]+\]/gi, '').trim();
+      // Strip ALL [key=value] tags from content
+      body.messages[m].content = msg.content.replace(/\[[a-zA-Z_][a-zA-Z0-9_]*=[^\]]+\]/gi, '').trim();
     }
   }
 
@@ -48,21 +45,18 @@ export function parseFeatures(body, headers) {
 export function applyThinkConfig(body, thinkValue, thinkConfig) {
   if (!thinkConfig || !thinkValue) return;
 
-  // "off" means remove thinking
   if (thinkValue === 'off' && thinkConfig.modes && thinkConfig.modes.off === null) {
     var paramPath = thinkConfig.param_path || 'thinking_config';
     delete body[paramPath];
     return;
   }
 
-  // Check named modes first
   if (thinkConfig.modes && thinkConfig.modes[thinkValue]) {
     var paramPath2 = thinkConfig.param_path || 'thinking_config';
     body[paramPath2] = JSON.parse(JSON.stringify(thinkConfig.modes[thinkValue]));
     return;
   }
 
-  // Check numeric value
   var numVal = Number(thinkValue);
   if (!isNaN(numVal) && thinkConfig.numeric_field) {
     var paramPath3 = thinkConfig.param_path || 'thinking_config';
@@ -71,7 +65,6 @@ export function applyThinkConfig(body, thinkValue, thinkConfig) {
     return;
   }
 
-  // Default to "on" mode if exists
   if (thinkConfig.modes && thinkConfig.modes.on) {
     var paramPath4 = thinkConfig.param_path || 'thinking_config';
     body[paramPath4] = JSON.parse(JSON.stringify(thinkConfig.modes.on));
@@ -84,14 +77,9 @@ export function applySearchConfig(body, searchValue, searchConfig) {
 
   if (searchConfig.inject && searchConfig.inject[searchValue] !== undefined) {
     var injection = searchConfig.inject[searchValue];
-    if (injection === null) {
-      // "off" — remove search tools if we know how
-      return;
-    }
-    // Merge injection into body
+    if (injection === null) return;
     for (var key in injection) {
       if (Array.isArray(injection[key]) && Array.isArray(body[key])) {
-        // Append to existing array
         body[key] = body[key].concat(injection[key]);
       } else {
         body[key] = JSON.parse(JSON.stringify(injection[key]));
