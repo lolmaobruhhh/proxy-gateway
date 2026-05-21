@@ -1,10 +1,6 @@
-// Parse ALL [key=value] tags from messages and headers
-// Not just think/search — ANY tag. Sandbox code decides what they mean.
-
 export function parseFeatures(body, headers) {
   var features = {};
 
-  // 1. Check x-proxy-features header
   var headerVal = '';
   if (headers && headers['x-proxy-features']) {
     headerVal = headers['x-proxy-features'];
@@ -20,8 +16,6 @@ export function parseFeatures(body, headers) {
     }
   }
 
-  // 2. Scan messages for ALL [key=value] tags
-  //    Message tags override header values
   if (body && Array.isArray(body.messages)) {
     for (var m = 0; m < body.messages.length; m++) {
       var msg = body.messages[m];
@@ -33,7 +27,6 @@ export function parseFeatures(body, headers) {
         features[match[1].toLowerCase()] = match[2].trim();
       }
 
-      // Strip ALL [key=value] tags from content
       body.messages[m].content = msg.content.replace(/\[[a-zA-Z_][a-zA-Z0-9_]*=[^\]]+\]/gi, '').trim();
     }
   }
@@ -41,7 +34,6 @@ export function parseFeatures(body, headers) {
   return features;
 }
 
-// Apply think_config to body for unhandled think feature
 export function applyThinkConfig(body, thinkValue, thinkConfig) {
   if (!thinkConfig || !thinkValue) return;
 
@@ -71,7 +63,6 @@ export function applyThinkConfig(body, thinkValue, thinkConfig) {
   }
 }
 
-// Apply search_config to body for unhandled search feature
 export function applySearchConfig(body, searchValue, searchConfig) {
   if (!searchConfig || !searchValue) return;
 
