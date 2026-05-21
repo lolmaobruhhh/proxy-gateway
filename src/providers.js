@@ -15,17 +15,14 @@ import { verifyPassword, verifyProviderAccess } from './auth.js';
 
 export var providersRouter = Router();
 
-// list visible providers only
 providersRouter.get('/', function(_req, res) {
   res.json(getVisibleProviders());
 });
 
-// list cloaked providers (names only)
 providersRouter.get('/cloaked', function(_req, res) {
   res.json(getCloakedProvidersList());
 });
 
-// reveal cloaked provider (password required)
 providersRouter.post('/cloaked/:prefix/reveal', function(req, res) {
   var prefix = req.params.prefix.toLowerCase();
   var p = getProvider(prefix);
@@ -39,7 +36,6 @@ providersRouter.post('/cloaked/:prefix/reveal', function(req, res) {
   res.json(p);
 });
 
-// get one provider
 providersRouter.get('/:prefix', function(req, res) {
   var p = getProvider(req.params.prefix.toLowerCase());
   if (!p) return res.status(404).json({ error: 'Not found' });
@@ -47,7 +43,6 @@ providersRouter.get('/:prefix', function(req, res) {
   res.json(p);
 });
 
-// get history
 providersRouter.get('/:prefix/history', function(req, res) {
   var prefix = req.params.prefix.toLowerCase();
   var p = getProvider(prefix);
@@ -55,7 +50,6 @@ providersRouter.get('/:prefix/history', function(req, res) {
   res.json(getHistory(prefix));
 });
 
-// create
 providersRouter.post('/', async function(req, res) {
   var body = req.body || {};
   var prefix = body.prefix;
@@ -65,7 +59,6 @@ providersRouter.post('/', async function(req, res) {
     return res.status(400).json({ error: 'prefix and upstream_url are required.' });
   }
 
-  // parse JSON fields
   var parsedSandbox = parseJsonField(body.sandbox);
   var parsedThinkConfig = parseJsonField(body.think_config);
   var parsedSearchConfig = parseJsonField(body.search_config);
@@ -95,12 +88,10 @@ providersRouter.post('/', async function(req, res) {
   res.status(201).json({ message: 'Provider "' + prefix + '" created.' });
 });
 
-// update
 providersRouter.put('/:prefix', async function(req, res) {
   var prefix = req.params.prefix.toLowerCase();
   var updates = req.body || {};
 
-  // parse JSON string fields
   var jsonFields = ['sandbox', 'think_config', 'search_config'];
   for (var i = 0; i < jsonFields.length; i++) {
     var field = jsonFields[i];
@@ -122,7 +113,6 @@ providersRouter.put('/:prefix', async function(req, res) {
   res.json({ message: 'Updated.', changes: result.changes });
 });
 
-// cloak
 providersRouter.post('/:prefix/cloak', async function(req, res) {
   var prefix = req.params.prefix.toLowerCase();
   var body = req.body || {};
@@ -134,7 +124,6 @@ providersRouter.post('/:prefix/cloak', async function(req, res) {
   res.json({ message: 'Provider cloaked.' });
 });
 
-// uncloak
 providersRouter.post('/:prefix/uncloak', async function(req, res) {
   var prefix = req.params.prefix.toLowerCase();
   var p = getProvider(prefix);
@@ -150,7 +139,6 @@ providersRouter.post('/:prefix/uncloak', async function(req, res) {
   res.json({ message: 'Provider uncloaked.' });
 });
 
-// delete (password protected)
 providersRouter.delete('/:prefix', async function(req, res) {
   var password = (req.body && req.body.password) || '';
   if (!verifyPassword(password)) {
