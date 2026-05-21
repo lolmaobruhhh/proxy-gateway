@@ -61,7 +61,6 @@ export function getProvider(prefix) {
   return (cache.providers || {})[prefix] || null;
 }
 
-// get visible (non-cloaked) providers only
 export function getVisibleProviders() {
   var result = {};
   var all = cache.providers || {};
@@ -73,7 +72,6 @@ export function getVisibleProviders() {
   return result;
 }
 
-// get cloaked providers (name only, no sensitive data)
 export function getCloakedProvidersList() {
   var result = [];
   var all = cache.providers || {};
@@ -94,7 +92,6 @@ export async function addProvider(provider) {
     return { ok: false, reason: 'Prefix "' + prefix + '" already exists. Pick another.' };
   }
 
-  // Ensure new fields have defaults
   provider.cloaked = provider.cloaked || false;
   provider.cloak_name = provider.cloak_name || '';
   provider.cloak_password = provider.cloak_password || '';
