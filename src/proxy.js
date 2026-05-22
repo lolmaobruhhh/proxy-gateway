@@ -1,360 +1,209 @@
-import vm from 'vm';
-import { getProvider } from './storage.js';
-import { parseCompoundKeys, getNextKey } from './keyManager.js';
-import { transformRequest, injectKey } from './transformer.js';
-import { recordProxyRequest } from './stats.js';
+import { parseFeatures, applyThinkConfig, applySearchConfig } from './features.js';
+import { runSandboxCode } from './sandboxRunner.js';
 
-// ── BUILT-IN PARSERS (convenience shortcuts) ────────────────
-// Each returns extracted text string or null to skip
+export function transformRequest(incomingBody, provider, strippedModel, requestPath, reqHeaders, reqMethod) {
+  var features = parseFeatures(incomingBody, reqHeaders);
+  var hasFeatures = Object.keys(features).length > 0;
 
-function parseGeminiChunk(data) {
-  try {
-    var g = JSON.parse(data);
-    if (!g.candidates || !g.candidates[0] || !g.candidates[0].content) return null;
-    var parts = g.candidates[0].content.parts;
-    var text = '';
-    for (var i = 0; i < parts.length; i++) {
-      if (parts[i].text) text += parts[i].text;
-      if (parts[i].thought) text += parts[i].thought;
-    }
-    return text || null;
-  } catch (e) { return null; }
-}
+  if (hasFeatures) {
+    console.log('[transform] detected features:', JSON.stringify(features));
+  }
 
-function parseAnthropicChunk(data, eventType) {
-  try {
-    var a = JSON.parse(data);
-    if (eventType === 'content_block_delta') {
-      return (a.delta && (a.delta.text || a.delta.thinking)) || null;
-    }
-    return null;
-  } catch (e) { return null; }
-}
+  var handled = {};
+  var workingBody = JSON.parse(JSON.stringify(incomingBody));
+  var codeOverrides = {
+    url: null,
+    url_path: null,
+    headers: null,
+    method: null,
+    response_format: null,
+    response_parser: null,
+    stream_content_type: null,
+    retry_codes: null,
+    timeout: null,
+  };
 
-function parseGeminiFull(responseBody) {
-  try {
-    var g = JSON.parse(responseBody);
-    var text = '';
-    if (g.candidates && g.candidates[0] && g.candidates[0].content && g.candidates[0].content.parts) {
-      for (var i = 0; i < g.candidates[0].content.parts.length; i++) {
-        var p = g.candidates[0].content.parts[i];
-        if (p.text) text += p.text;
-        if (p.thought) text += p.thought;
+  if (provider.sandbox_code) {
+    var requestContext = {
+      path: requestPath,
+      method: reqMethod || 'POST',
+      original_model: incomingBody.model || '',
+      stripped_model: strippedModel || '',
+    };
+
+    var codeResult = runSandboxCode(provider.sandbox_code, workingBody, features, provider, requestContext);
+    workingBody = codeResult.body;
+    handled = codeResult.handled;
+    codeOverrides.url = codeResult.url;
+    codeOverrides.url_path = codeResult.url_path;
+    codeOverrides.headers = codeResult.headers;
+    codeOverrides.method = codeResult.method;
+    codeOverrides.response_format = codeResult.response_format;
+    codeOverrides.response_parser = codeResult.response_parser;
+    codeOverrides.stream_content_type = codeResult.stream_content_type;
+    codeOverrides.retry_codes = codeResult.retry_codes;
+    codeOverrides.timeout = codeResult.timeout;
+
+    console.log('[transform] sandbox code handled:', JSON.stringify(handled));
+    if (codeOverrides.response_format) console.log('[transform] response_format:', codeOverrides.response_format);
+  }
+
+  if (features.think && !handled.think && provider.think_config) {
+    applyThinkConfig(workingBody, features.think, provider.think_config);
+  }
+
+  if (features.search && !handled.search && provider.search_config) {
+    applySearchConfig(workingBody, features.search, provider.search_config);
+  }
+
+  var sandbox = provider.sandbox || null;
+
+  if (!sandbox) {
+    if (strippedModel) workingBody.model = strippedModel;
+
+    var defaultHeaders = buildDefaultHeaders(provider);
+    if (codeOverrides.headers) {
+      for (var hk in codeOverrides.headers) {
+        defaultHeaders[hk] = codeOverrides.headers[hk];
       }
     }
-    return text;
-  } catch (e) { return null; }
-}
 
-function parseAnthropicFull(responseBody) {
-  try {
-    var a = JSON.parse(responseBody);
-    var text = '';
-    if (a.content && Array.isArray(a.content)) {
-      for (var i = 0; i < a.content.length; i++) {
-        if (a.content[i].type === 'text') text += a.content[i].text;
-        if (a.content[i].type === 'thinking') text += a.content[i].thinking;
-      }
+    return {
+      url: codeOverrides.url || null,
+      url_path: codeOverrides.url_path || requestPath,
+      headers: defaultHeaders,
+      body: workingBody,
+      method: codeOverrides.method || null,
+      response_format: codeOverrides.response_format || null,
+      response_parser: codeOverrides.response_parser || null,
+      stream_content_type: codeOverrides.stream_content_type || null,
+      retry_codes: codeOverrides.retry_codes || null,
+      timeout: codeOverrides.timeout || null,
+    };
+  }
+
+  var urlPath = codeOverrides.url_path || sandbox.url_path || requestPath;
+
+  var systemMsg = '';
+  var nonSystemMessages = workingBody.messages || [];
+  if (Array.isArray(nonSystemMessages)) {
+    var sysIdx = -1;
+    for (var i = 0; i < nonSystemMessages.length; i++) {
+      if (nonSystemMessages[i].role === 'system') { sysIdx = i; break; }
     }
-    return text;
-  } catch (e) { return null; }
-}
+    if (sysIdx !== -1) {
+      systemMsg = nonSystemMessages[sysIdx].content || '';
+      nonSystemMessages = nonSystemMessages.filter(function(_, idx) { return idx !== sysIdx; });
+    }
+  }
 
-// ── COMPILE CUSTOM PARSER ───────────────────────────────────
-// Compiles a user-provided parser function string into a callable function
-// Runs in a sandboxed VM context for safety
-
-function compileCustomParser(parserStr) {
-  if (!parserStr || typeof parserStr !== 'string') return null;
-  try {
-    var code = 'var __parser = ' + parserStr.trim() + ';';
-    var ctx = vm.createContext({
-      JSON: JSON, Array: Array, Object: Object, String: String,
-      Number: Number, Math: Math, parseInt: parseInt, parseFloat: parseFloat,
-      isNaN: isNaN, Date: Date, RegExp: RegExp
+  var body;
+  if (sandbox.body_template) {
+    body = JSON.parse(JSON.stringify(sandbox.body_template));
+    body = replacePlaceholders(body, {
+      'spc:claude-opus-4-6-20260205-thinking': strippedModel || workingBody.model || '',
+      '{{MESSAGES}}': workingBody.messages || [],
+      '{{SYSTEM_MESSAGE}}': systemMsg,
+      '{{NON_SYSTEM_MESSAGES}}': nonSystemMessages,
     });
-    var script = new vm.Script(code);
-    script.runInContext(ctx, { timeout: 1000 });
-    if (typeof ctx.__parser === 'function') {
-      return function(data, eventType) {
-        try {
-          ctx.__data = data;
-          ctx.__event = eventType || '';
-          var runScript = new vm.Script('__result = __parser(__data, __event);');
-          runScript.runInContext(ctx, { timeout: 500 });
-          return ctx.__result || null;
-        } catch (e) {
-          return null;
+
+    if (workingBody && typeof workingBody === 'object') {
+      var templateKeys = Object.keys(body);
+      for (var key in workingBody) {
+        if (key === 'model' || key === 'messages') continue;
+        if (templateKeys.indexOf(key) === -1) {
+          body[key] = workingBody[key];
         }
-      };
+      }
     }
-    return null;
-  } catch (e) {
-    console.error('[proxy] failed to compile custom parser:', e.message);
-    return null;
+  } else {
+    body = JSON.parse(JSON.stringify(workingBody));
+    if (strippedModel) body.model = strippedModel;
   }
+
+  if (sandbox.forced_fields) {
+    deepMerge(body, sandbox.forced_fields);
+  }
+
+  var headers = sandbox.headers ? JSON.parse(JSON.stringify(sandbox.headers)) : buildDefaultHeaders(provider);
+  if (codeOverrides.headers) {
+    for (var hk2 in codeOverrides.headers) {
+      headers[hk2] = codeOverrides.headers[hk2];
+    }
+  }
+
+  return {
+    url: codeOverrides.url || null,
+    url_path: urlPath,
+    headers: headers,
+    body: body,
+    method: codeOverrides.method || null,
+    response_format: codeOverrides.response_format || null,
+    response_parser: codeOverrides.response_parser || null,
+    stream_content_type: codeOverrides.stream_content_type || null,
+    retry_codes: codeOverrides.retry_codes || null,
+    timeout: codeOverrides.timeout || null,
+  };
 }
 
-// ── MAIN PROXY HANDLER ──────────────────────────────────────
-
-export async function handleProxy(req, res) {
-  var ip = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.socket ? req.socket.remoteAddress : 'unknown') || 'unknown';
-
-  var body = req.body || {};
-  var modelRaw = body.model || '';
-  var colonIdx = modelRaw.indexOf(':');
-
-  if (!modelRaw || colonIdx === -1) {
-    recordProxyRequest(null, ip, true);
-    return res.status(400).json({
-      error: {
-        message: 'Model field must include a provider prefix, e.g. "opn:gpt-4o"',
-        type: 'proxy_error',
-      }
-    });
-  }
-
-  var prefix = modelRaw.slice(0, colonIdx).toLowerCase();
-  var strippedModel = modelRaw.slice(colonIdx + 1);
-
-  var provider = getProvider(prefix);
-  if (!provider) {
-    recordProxyRequest(prefix, ip, true);
-    return res.status(404).json({
-      error: {
-        message: 'No provider registered with prefix "' + prefix + '".',
-        type: 'proxy_error',
-      }
-    });
-  }
-
-  var authHeader = req.headers['authorization'] || '';
-  var allKeys = parseCompoundKeys(authHeader);
-  var providerKeys = allKeys[prefix] || [];
-
-  if (providerKeys.length === 0 && provider.optional_key) {
-    providerKeys.push(provider.optional_key);
-  }
-
-  if (providerKeys.length === 0) {
-    recordProxyRequest(prefix, ip, true);
-    return res.status(401).json({
-      error: {
-        message: 'No API keys for prefix "' + prefix + '". Send keys as: Authorization: Bearer ' + prefix + '=key1,key2',
-        type: 'auth_error',
-      }
-    });
-  }
-
-  var transformed = transformRequest(body, provider, strippedModel, req.path, req.headers, req.method);
-  var clientWantsStream = body.stream === true;
-  var responseFormat = (transformed.response_format || 'openai').toLowerCase();
-
-  // Compile custom parser if provided
-  var customParser = null;
-  if (responseFormat === 'custom' && transformed.response_parser) {
-    customParser = compileCustomParser(transformed.response_parser);
-    if (!customParser) {
-      console.error('[proxy] custom parser compilation failed, falling back to raw');
-      responseFormat = 'raw';
-    }
-  }
-
-  // Select the chunk parser function
-  var chunkParser = null;
-  if (responseFormat === 'gemini') {
-    chunkParser = parseGeminiChunk;
-  } else if (responseFormat === 'anthropic') {
-    chunkParser = parseAnthropicChunk;
-  } else if (responseFormat === 'custom' && customParser) {
-    chunkParser = customParser;
-  }
-
-  var skipped = new Set();
-  var lastError = null;
-
-  while (true) {
-    var picked = getNextKey(prefix, providerKeys, skipped);
-    if (!picked) break;
-
-    var key = picked.key;
-    var index = picked.index;
-    var headers = injectKey(transformed.headers, key);
-
-    var upstreamUrl;
-    if (transformed.url) {
-      upstreamUrl = transformed.url.replace(/{{KEY}}/g, key);
+export function injectKey(headers, key) {
+  var result = {};
+  for (var k in headers) {
+    if (typeof headers[k] === 'string') {
+      result[k] = headers[k].replace(/{{KEY}}/g, key);
     } else {
-      upstreamUrl = provider.upstream_url + transformed.url_path;
+      result[k] = headers[k];
     }
+  }
+  return result;
+}
 
-    var httpMethod = transformed.method || (req.method === 'GET' ? 'GET' : (req.method || 'POST'));
+function buildDefaultHeaders(provider) {
+  var h = { 'content-type': 'application/json' };
+  var authType = (provider.auth_type || 'bearer').toLowerCase();
+  var authHeader = provider.auth_header || 'authorization';
 
-    try {
-      var fetchOpts = {
-        method: httpMethod,
-        headers: headers,
-        signal: AbortSignal.timeout(300000),
-      };
+  if (authType === 'bearer') {
+    h[authHeader] = 'Bearer {{KEY}}';
+  } else if (authType === 'x-api-key') {
+    h['x-api-key'] = '{{KEY}}';
+  } else {
+    h[authHeader] = '{{KEY}}';
+  }
+  return h;
+}
 
-      if (httpMethod !== 'GET' && httpMethod !== 'HEAD') {
-        fetchOpts.body = JSON.stringify(transformed.body);
+function replacePlaceholders(obj, map) {
+  if (typeof obj === 'string') {
+    for (var ph in map) {
+      if (obj === ph) return map[ph];
+      if (obj.indexOf(ph) !== -1) {
+        var val = map[ph];
+        obj = obj.split(ph).join(typeof val === 'string' ? val : JSON.stringify(val));
       }
+    }
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(function(item) { return replacePlaceholders(item, map); });
+  }
+  if (obj && typeof obj === 'object') {
+    var out = {};
+    for (var k in obj) {
+      out[k] = replacePlaceholders(obj[k], map);
+    }
+    return out;
+  }
+  return obj;
+}
 
-      var upstream = await fetch(upstreamUrl, fetchOpts);
-
-      if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429) {
-        skipped.add(index);
-        lastError = 'Key #' + (index + 1) + ' returned ' + upstream.status;
-        continue;
-      }
-
-      var contentType = upstream.headers.get('content-type') || '';
-      var isSSE = contentType.indexOf('text/event-stream') !== -1;
-
-      for (var pair of upstream.headers.entries()) {
-        var hk = pair[0];
-        var hv = pair[1];
-        var lower = hk.toLowerCase();
-        if (['transfer-encoding', 'connection', 'keep-alive', 'content-encoding'].indexOf(lower) !== -1) continue;
-        res.setHeader(hk, hv);
-      }
-
-      res.status(upstream.status);
-
-      // ── RAW MODE ──────────────────────────────────────────
-      if (responseFormat === 'raw') {
-        if (isSSE) {
-          res.setHeader('content-type', 'text/event-stream');
-          var rawReader = upstream.body.getReader();
-          var rawDecoder = new TextDecoder();
-          try {
-            while (true) {
-              var rawChunk = await rawReader.read();
-              if (rawChunk.done) break;
-              res.write(rawDecoder.decode(rawChunk.value, { stream: true }));
-            }
-          } catch (e) {}
-          res.end();
-        } else {
-          var rawBody = await upstream.text();
-          res.send(rawBody);
-        }
-        recordProxyRequest(prefix, ip, upstream.status >= 400);
-        return;
-      }
-
-      // ── STREAMING ─────────────────────────────────────────
-      if (clientWantsStream && isSSE) {
-        res.setHeader('content-type', 'text/event-stream');
-        res.setHeader('cache-control', 'no-cache');
-        res.setHeader('connection', 'keep-alive');
-
-        var reader = upstream.body.getReader();
-        var decoder = new TextDecoder();
-        var streamBuffer = '';
-        var streamId = 'chatcmpl-' + Date.now();
-        var fullModel = prefix + ':' + strippedModel;
-
-        try {
-          while (true) {
-            var chunk = await reader.read();
-            if (chunk.done) break;
-
-            var textChunk = decoder.decode(chunk.value, { stream: true });
-
-            // OpenAI format — direct passthrough
-            if (responseFormat === 'openai') {
-              res.write(textChunk);
-              continue;
-            }
-
-            // Non-OpenAI — parse and translate
-            streamBuffer += textChunk;
-            var lines = streamBuffer.split('\n');
-            streamBuffer = lines.pop() || '';
-
-            var currentEventType = '';
-
-            for (var li = 0; li < lines.length; li++) {
-              var line = lines[li].trim();
-
-              if (line.indexOf('event: ') === 0) {
-                currentEventType = line.slice(7).trim();
-                continue;
-              }
-
-              if (line.indexOf('data: ') !== 0) continue;
-              var dataStr = line.slice(6).trim();
-              if (dataStr === '[DONE]') {
-                res.write('data: [DONE]\n\n');
-                continue;
-              }
-
-              // Use the selected parser
-              var extractedText = chunkParser ? chunkParser(dataStr, currentEventType) : null;
-
-              if (extractedText) {
-                var openaiChunk = {
-                  id: streamId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: fullModel,
-                  choices: [{
-                    index: 0,
-                    delta: { content: extractedText },
-                    finish_reason: null
-                  }]
-                };
-                res.write('data: ' + JSON.stringify(openaiChunk) + '\n\n');
-              }
-            }
-          }
-
-          // Send final DONE
-          if (responseFormat !== 'openai') {
-            res.write('data: [DONE]\n\n');
-          }
-        } catch (e) {
-          console.error('[proxy] stream error:', e.message);
-        } finally {
-          res.end();
-        }
-        recordProxyRequest(prefix, ip, upstream.status >= 400);
-        return;
-      }
-
-      // ── NON-STREAM SSE (buffer to single JSON) ────────────
-      if (!clientWantsStream && isSSE) {
-        var reader2 = upstream.body.getReader();
-        var decoder2 = new TextDecoder();
-        var fullContent = '';
-        var rModel = strippedModel;
-        var finishReason = 'stop';
-        var responseId = '';
-        var currentEventType2 = '';
-
-        try {
-          var buffer2 = '';
-          while (true) {
-            var chunk2 = await reader2.read();
-            if (chunk2.done) break;
-            buffer2 += decoder2.decode(chunk2.value, { stream: true });
-            var lines2 = buffer2.split('\n');
-            buffer2 = lines2.pop() || '';
-
-            for (var li2 = 0; li2 < lines2.length; li2++) {
-              var line2 = lines2[li2].trim();
-
-              if (line2.indexOf('event: ') === 0) {
-                currentEventType2 = line2.slice(7).trim();
-                continue;
-              }
-
-              if (line2.indexOf('data: ') !== 0) continue;
-              var data2 = line2.slice(6).trim();
-              if (data2 === '[DONE]') continue;
-
-              if (chunkParser) {
-                var extracted = chunkParser(data2, currentEventType2);
-                if (extracted
+function deepMerge(target, source) {
+  for (var k in source) {
+    var v = source[k];
+    if (v && typeof v === 'object' && !Array.isArray(v) && target[k] && typeof target[k] === 'object') {
+      deepMerge(target[k], v);
+    } else {
+      target[k] = v;
+    }
+  }
+}
