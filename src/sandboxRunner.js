@@ -10,6 +10,9 @@ export function runSandboxCode(code, reqBody, features, provider, requestContext
     method: null,
     response_format: null,
     response_parser: null,
+    stream_content_type: null,
+    retry_codes: null,
+    timeout: null,
   };
 
   if (!code || typeof code !== 'string' || !code.trim()) {
@@ -89,6 +92,9 @@ export function runSandboxCode(code, reqBody, features, provider, requestContext
       if (r.method) result.method = String(r.method).toUpperCase();
       if (r.response_format) result.response_format = String(r.response_format).toLowerCase();
       if (r.response_parser) result.response_parser = String(r.response_parser);
+      if (r.stream_content_type) result.stream_content_type = String(r.stream_content_type).toLowerCase();
+      if (r.retry_codes && Array.isArray(r.retry_codes)) result.retry_codes = r.retry_codes;
+      if (r.timeout && !isNaN(Number(r.timeout))) result.timeout = Number(r.timeout);
       if (r.headers && typeof r.headers === 'object') {
         result.headers = {};
         for (var hk in r.headers) {
