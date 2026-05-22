@@ -2,7 +2,6 @@ import { parseFeatures, applyThinkConfig, applySearchConfig } from './features.j
 import { runSandboxCode } from './sandboxRunner.js';
 
 export function transformRequest(incomingBody, provider, strippedModel, requestPath, reqHeaders, reqMethod) {
-  // 1. Parse and strip ALL [key=value] tags from messages
   var features = parseFeatures(incomingBody, reqHeaders);
   var hasFeatures = Object.keys(features).length > 0;
 
@@ -10,7 +9,6 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     console.log('[transform] detected features:', JSON.stringify(features));
   }
 
-  // 2. Run sandbox code if present
   var handled = {};
   var workingBody = JSON.parse(JSON.stringify(incomingBody));
   var codeOverrides = {
@@ -18,6 +16,8 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     url_path: null,
     headers: null,
     method: null,
+    response_format: null,
+    response_parser: null,
   };
 
   if (provider.sandbox_code) {
@@ -35,27 +35,22 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     codeOverrides.url_path = codeResult.url_path;
     codeOverrides.headers = codeResult.headers;
     codeOverrides.method = codeResult.method;
+    codeOverrides.response_format = codeResult.response_format;
+    codeOverrides.response_parser = codeResult.response_parser;
 
     console.log('[transform] sandbox code handled:', JSON.stringify(handled));
-    if (codeOverrides.url) console.log('[transform] sandbox code override url:', codeOverrides.url);
-    if (codeOverrides.url_path) console.log('[transform] sandbox code override path:', codeOverrides.url_path);
-    if (codeOverrides.headers) console.log('[transform] sandbox code override headers:', JSON.stringify(Object.keys(codeOverrides.headers)));
-    if (codeOverrides.method) console.log('[transform] sandbox code override method:', codeOverrides.method);
+    if (codeOverrides.response_format) console.log('[transform] response_format:', codeOverrides.response_format);
+    if (codeOverrides.response_parser) console.log('[transform] has custom response_parser');
   }
 
-  // 3. Apply think_config for unhandled thinking
   if (features.think && !handled.think && provider.think_config) {
     applyThinkConfig(workingBody, features.think, provider.think_config);
-    console.log('[transform] applied think_config for:', features.think);
   }
 
-  // 4. Apply search_config for unhandled search
   if (features.search && !handled.search && provider.search_config) {
     applySearchConfig(workingBody, features.search, provider.search_config);
-    console.log('[transform] applied search_config for:', features.search);
   }
 
-  // 5. Apply sandbox JSON template or default passthrough
   var sandbox = provider.sandbox || null;
 
   if (!sandbox) {
@@ -74,10 +69,11 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
       headers: defaultHeaders,
       body: workingBody,
       method: codeOverrides.method || null,
+      response_format: codeOverrides.response_format || null,
+      response_parser: codeOverrides.response_parser || null,
     };
   }
 
-  // Sandbox JSON present
   var urlPath = codeOverrides.url_path || sandbox.url_path || requestPath;
 
   var systemMsg = '';
@@ -97,7 +93,7 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
   if (sandbox.body_template) {
     body = JSON.parse(JSON.stringify(sandbox.body_template));
     body = replacePlaceholders(body, {
-      '{{MODEL}}': strippedModel || workingBody.model || '',
+      'spc:claude-opus-4-6-20260205-thinking': strippedModel || workingBody.model || '',
       '{{MESSAGES}}': workingBody.messages || [],
       '{{SYSTEM_MESSAGE}}': systemMsg,
       '{{NON_SYSTEM_MESSAGES}}': nonSystemMessages,
@@ -134,6 +130,8 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     headers: headers,
     body: body,
     method: codeOverrides.method || null,
+    response_format: codeOverrides.response_format || null,
+    response_parser: codeOverrides.response_parser || null,
   };
 }
 
