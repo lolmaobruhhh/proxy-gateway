@@ -18,6 +18,9 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     method: null,
     response_format: null,
     response_parser: null,
+    stream_content_type: null,
+    retry_codes: null,
+    timeout: null,
   };
 
   if (provider.sandbox_code) {
@@ -37,10 +40,12 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     codeOverrides.method = codeResult.method;
     codeOverrides.response_format = codeResult.response_format;
     codeOverrides.response_parser = codeResult.response_parser;
+    codeOverrides.stream_content_type = codeResult.stream_content_type;
+    codeOverrides.retry_codes = codeResult.retry_codes;
+    codeOverrides.timeout = codeResult.timeout;
 
     console.log('[transform] sandbox code handled:', JSON.stringify(handled));
     if (codeOverrides.response_format) console.log('[transform] response_format:', codeOverrides.response_format);
-    if (codeOverrides.response_parser) console.log('[transform] has custom response_parser');
   }
 
   if (features.think && !handled.think && provider.think_config) {
@@ -71,6 +76,9 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
       method: codeOverrides.method || null,
       response_format: codeOverrides.response_format || null,
       response_parser: codeOverrides.response_parser || null,
+      stream_content_type: codeOverrides.stream_content_type || null,
+      retry_codes: codeOverrides.retry_codes || null,
+      timeout: codeOverrides.timeout || null,
     };
   }
 
@@ -132,6 +140,9 @@ export function transformRequest(incomingBody, provider, strippedModel, requestP
     method: codeOverrides.method || null,
     response_format: codeOverrides.response_format || null,
     response_parser: codeOverrides.response_parser || null,
+    stream_content_type: codeOverrides.stream_content_type || null,
+    retry_codes: codeOverrides.retry_codes || null,
+    timeout: codeOverrides.timeout || null,
   };
 }
 
