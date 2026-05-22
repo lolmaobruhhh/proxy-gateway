@@ -8,6 +8,8 @@ export function runSandboxCode(code, reqBody, features, provider, requestContext
     url_path: null,
     headers: null,
     method: null,
+    response_format: null,
+    response_parser: null,
   };
 
   if (!code || typeof code !== 'string' || !code.trim()) {
@@ -77,7 +79,7 @@ export function runSandboxCode(code, reqBody, features, provider, requestContext
 
       if (r.body) {
         result.body = r.body;
-      } else if (!r.handled && !r.url && !r.url_path && !r.headers && !r.method) {
+      } else if (!r.handled && !r.url && !r.url_path && !r.headers && !r.method && !r.response_format && !r.response_parser) {
         result.body = r;
       }
 
@@ -85,6 +87,8 @@ export function runSandboxCode(code, reqBody, features, provider, requestContext
       if (r.url) result.url = String(r.url);
       if (r.url_path) result.url_path = String(r.url_path);
       if (r.method) result.method = String(r.method).toUpperCase();
+      if (r.response_format) result.response_format = String(r.response_format).toLowerCase();
+      if (r.response_parser) result.response_parser = String(r.response_parser);
       if (r.headers && typeof r.headers === 'object') {
         result.headers = {};
         for (var hk in r.headers) {
