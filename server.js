@@ -348,4 +348,6 @@ try {
   console.error('[boot] Storage init error:', e.message);
 }
 
-app.listen(PORT, '0.0.0.0',
+app.listen(PORT, '0.0.0.0', function() {
+  console.log('Proxy Gateway live on :' + PORT);
+});
