@@ -1,12 +1,11 @@
 import vm from 'vm';
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { getProvider } from './storage.js';
 import { parseCompoundKeys, getNextKey } from './keyManager.js';
 import { transformRequest, injectKey } from './transformer.js';
 import { recordProxyRequest } from './stats.js';
 
 // ── BUILT-IN CHUNK PARSERS ──────────────────────────────────
-// Return extracted text string or null to skip
-
 function parseGeminiChunk(data) {
   try {
     var g = JSON.parse(data);
@@ -32,7 +31,6 @@ function parseAnthropicChunk(data, eventType) {
 }
 
 // ── BUILT-IN FULL RESPONSE PARSERS ──────────────────────────
-
 function parseGeminiFull(responseBody) {
   try {
     var g = JSON.parse(responseBody);
@@ -63,7 +61,6 @@ function parseAnthropicFull(responseBody) {
 }
 
 // ── COMPILE CUSTOM PARSER ───────────────────────────────────
-
 function compileCustomParser(parserStr) {
   if (!parserStr || typeof parserStr !== 'string') return null;
   try {
@@ -83,20 +80,14 @@ function compileCustomParser(parserStr) {
           var runScript = new vm.Script('__result = __parser(__data, __event);');
           runScript.runInContext(ctx, { timeout: 500 });
           return ctx.__result || null;
-        } catch (e) {
-          return null;
-        }
+        } catch (e) { return null; }
       };
     }
     return null;
-  } catch (e) {
-    console.error('[proxy] failed to compile custom parser:', e.message);
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 // ── MAIN PROXY HANDLER ──────────────────────────────────────
-
 export async function handleProxy(req, res) {
   var ip = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.socket ? req.socket.remoteAddress : 'unknown') || 'unknown';
 
@@ -106,12 +97,7 @@ export async function handleProxy(req, res) {
 
   if (!modelRaw || colonIdx === -1) {
     recordProxyRequest(null, ip, true);
-    return res.status(400).json({
-      error: {
-        message: 'Model field must include a provider prefix, e.g. "opn:gpt-4o"',
-        type: 'proxy_error',
-      }
-    });
+    return res.status(400).json({ error: { message: 'Model field must include a provider prefix, e.g. "opn:gpt-4o"', type: 'proxy_error' }});
   }
 
   var prefix = modelRaw.slice(0, colonIdx).toLowerCase();
@@ -120,12 +106,7 @@ export async function handleProxy(req, res) {
   var provider = getProvider(prefix);
   if (!provider) {
     recordProxyRequest(prefix, ip, true);
-    return res.status(404).json({
-      error: {
-        message: 'No provider registered with prefix "' + prefix + '".',
-        type: 'proxy_error',
-      }
-    });
+    return res.status(404).json({ error: { message: 'No provider registered with prefix "' + prefix + '".', type: 'proxy_error' }});
   }
 
   var authHeader = req.headers['authorization'] || '';
@@ -138,42 +119,27 @@ export async function handleProxy(req, res) {
 
   if (providerKeys.length === 0) {
     recordProxyRequest(prefix, ip, true);
-    return res.status(401).json({
-      error: {
-        message: 'No API keys for prefix "' + prefix + '". Send keys as: Authorization: Bearer ' + prefix + '=key1,key2',
-        type: 'auth_error',
-      }
-    });
+    return res.status(401).json({ error: { message: 'No API keys for prefix "' + prefix + '". Send keys as: Authorization: Bearer ' + prefix + '=key1,key2', type: 'auth_error' }});
   }
 
   var transformed = transformRequest(body, provider, strippedModel, req.path, req.headers, req.method);
   var clientWantsStream = body.stream === true;
   var responseFormat = (transformed.response_format || 'openai').toLowerCase();
 
-  // Behavior overrides from sandbox code
   var customStreamContentType = transformed.stream_content_type || null;
   var extraRetryCodes = transformed.retry_codes || [];
   var customTimeout = transformed.timeout || 300000;
 
-  // Compile custom parser if needed
   var customParser = null;
   if (responseFormat === 'custom' && transformed.response_parser) {
     customParser = compileCustomParser(transformed.response_parser);
-    if (!customParser) {
-      console.error('[proxy] custom parser failed to compile, falling back to raw');
-      responseFormat = 'raw';
-    }
+    if (!customParser) responseFormat = 'raw';
   }
 
-  // Select chunk parser
   var chunkParser = null;
-  if (responseFormat === 'gemini') {
-    chunkParser = parseGeminiChunk;
-  } else if (responseFormat === 'anthropic') {
-    chunkParser = parseAnthropicChunk;
-  } else if (responseFormat === 'custom' && customParser) {
-    chunkParser = customParser;
-  }
+  if (responseFormat === 'gemini') chunkParser = parseGeminiChunk;
+  else if (responseFormat === 'anthropic') chunkParser = parseAnthropicChunk;
+  else if (responseFormat === 'custom' && customParser) chunkParser = customParser;
 
   var skipped = new Set();
   var lastError = null;
@@ -187,11 +153,8 @@ export async function handleProxy(req, res) {
     var headers = injectKey(transformed.headers, key);
 
     var upstreamUrl;
-    if (transformed.url) {
-      upstreamUrl = transformed.url.replace(/{{KEY}}/g, key);
-    } else {
-      upstreamUrl = provider.upstream_url + transformed.url_path;
-    }
+    if (transformed.url) upstreamUrl = transformed.url.replace(/{{KEY}}/g, key);
+    else upstreamUrl = provider.upstream_url + transformed.url_path;
 
     var httpMethod = transformed.method || (req.method === 'GET' ? 'GET' : (req.method || 'POST'));
 
@@ -206,14 +169,17 @@ export async function handleProxy(req, res) {
         fetchOpts.body = JSON.stringify(transformed.body);
       }
 
-      var upstream = await fetch(upstreamUrl, fetchOpts);
+      // ── INJECT PROXY AGENT IF KEY HAS FORWARD PROXY ──
+      if (picked.proxyUrl) {
+        fetchOpts.dispatcher = new ProxyAgent(picked.proxyUrl);
+        console.log('[proxy] routing through forward proxy for key index ' + index);
+      }
 
-      // Retry logic — default codes + sandbox-defined extra codes
+      var upstream = await undiciFetch(upstreamUrl, fetchOpts);
+
       var retryCodes = [401, 403, 429];
       for (var rc = 0; rc < extraRetryCodes.length; rc++) {
-        if (retryCodes.indexOf(extraRetryCodes[rc]) === -1) {
-          retryCodes.push(extraRetryCodes[rc]);
-        }
+        if (retryCodes.indexOf(extraRetryCodes[rc]) === -1) retryCodes.push(Number(extraRetryCodes[rc]));
       }
 
       if (retryCodes.indexOf(upstream.status) !== -1) {
@@ -223,29 +189,19 @@ export async function handleProxy(req, res) {
       }
 
       var contentType = upstream.headers.get('content-type') || '';
-      
-      // Stream detection — check standard SSE + custom content type from sandbox
       var isSSE = contentType.indexOf('text/event-stream') !== -1;
-      if (!isSSE && customStreamContentType) {
-        isSSE = contentType.indexOf(customStreamContentType) !== -1;
-      }
-      // Also detect ndjson as stream
-      if (!isSSE && contentType.indexOf('application/x-ndjson') !== -1) {
-        isSSE = true;
-      }
+      if (!isSSE && customStreamContentType) isSSE = contentType.indexOf(customStreamContentType) !== -1;
+      if (!isSSE && contentType.indexOf('application/x-ndjson') !== -1) isSSE = true;
 
-      // Copy response headers
       for (var pair of upstream.headers.entries()) {
-        var hk = pair[0];
-        var hv = pair[1];
-        var lower = hk.toLowerCase();
+        var hk = pair[0], hv = pair[1], lower = hk.toLowerCase();
         if (['transfer-encoding', 'connection', 'keep-alive', 'content-encoding'].indexOf(lower) !== -1) continue;
         res.setHeader(hk, hv);
       }
 
       res.status(upstream.status);
 
-      // ── RAW MODE ──────────────────────────────────────────
+      // ── RAW MODE ──
       if (responseFormat === 'raw') {
         if (isSSE) {
           res.setHeader('content-type', 'text/event-stream');
@@ -267,7 +223,7 @@ export async function handleProxy(req, res) {
         return;
       }
 
-      // ── STREAMING ─────────────────────────────────────────
+      // ── STREAMING ──
       if (clientWantsStream && isSSE) {
         res.setHeader('content-type', 'text/event-stream');
         res.setHeader('cache-control', 'no-cache');
@@ -286,80 +242,38 @@ export async function handleProxy(req, res) {
             if (chunk.done) break;
 
             var textChunk = decoder.decode(chunk.value, { stream: true });
+            if (responseFormat === 'openai') { res.write(textChunk); continue; }
 
-            // OpenAI format — direct passthrough
-            if (responseFormat === 'openai') {
-              res.write(textChunk);
-              continue;
-            }
-
-            // Non-OpenAI — parse line by line and translate
             streamBuffer += textChunk;
             var lines = streamBuffer.split('\n');
             streamBuffer = lines.pop() || '';
 
             var currentEventType = '';
-
             for (var li = 0; li < lines.length; li++) {
               var line = lines[li].trim();
-
-              // Track SSE event type (used by Anthropic)
-              if (line.indexOf('event: ') === 0) {
-                currentEventType = line.slice(7).trim();
-                continue;
-              }
-
+              if (line.indexOf('event: ') === 0) { currentEventType = line.slice(7).trim(); continue; }
               if (line.indexOf('data: ') !== 0) continue;
               var dataStr = line.slice(6).trim();
-              
-              if (dataStr === '[DONE]') {
-                res.write('data: [DONE]\n\n');
-                sentDone = true;
-                continue;
-              }
+              if (dataStr === '[DONE]') { res.write('data: [DONE]\n\n'); sentDone = true; continue; }
 
-              // Use selected parser to extract text
               var extractedText = chunkParser ? chunkParser(dataStr, currentEventType) : null;
-
               if (extractedText) {
-                var openaiChunk = {
-                  id: streamId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: fullModel,
-                  choices: [{
-                    index: 0,
-                    delta: { content: extractedText },
-                    finish_reason: null
-                  }]
-                };
+                var openaiChunk = { id: streamId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: fullModel, choices: [{ index: 0, delta: { content: extractedText }, finish_reason: null }] };
                 res.write('data: ' + JSON.stringify(openaiChunk) + '\n\n');
               }
             }
           }
-
-          // Send [DONE] if we haven't already
-          if (responseFormat !== 'openai' && !sentDone) {
-            res.write('data: [DONE]\n\n');
-          }
-        } catch (e) {
-          console.error('[proxy] stream error:', e.message);
-        } finally {
-          res.end();
-        }
+          if (responseFormat !== 'openai' && !sentDone) res.write('data: [DONE]\n\n');
+        } catch (e) {} finally { res.end(); }
         recordProxyRequest(prefix, ip, upstream.status >= 400);
         return;
       }
 
-      // ── NON-STREAM SSE (buffer to single JSON) ────────────
+      // ── BUFFER SSE TO SINGLE JSON ──
       if (!clientWantsStream && isSSE) {
         var reader2 = upstream.body.getReader();
         var decoder2 = new TextDecoder();
-        var fullContent = '';
-        var rModel = strippedModel;
-        var finishReason = 'stop';
-        var responseId = '';
-        var currentEventType2 = '';
+        var fullContent = '', rModel = strippedModel, finishReason = 'stop', responseId = '', currentEventType2 = '';
 
         try {
           var buffer2 = '';
@@ -372,32 +286,20 @@ export async function handleProxy(req, res) {
 
             for (var li2 = 0; li2 < lines2.length; li2++) {
               var line2 = lines2[li2].trim();
-
-              if (line2.indexOf('event: ') === 0) {
-                currentEventType2 = line2.slice(7).trim();
-                continue;
-              }
-
+              if (line2.indexOf('event: ') === 0) { currentEventType2 = line2.slice(7).trim(); continue; }
               if (line2.indexOf('data: ') !== 0) continue;
               var data2 = line2.slice(6).trim();
               if (data2 === '[DONE]') continue;
 
               if (chunkParser) {
-                // Use same parser for buffering
                 var extracted = chunkParser(data2, currentEventType2);
                 if (extracted) fullContent += extracted;
               } else {
-                // OpenAI format fallback
                 try {
                   var parsed = JSON.parse(data2);
-                  responseId = parsed.id || responseId;
-                  rModel = parsed.model || rModel;
-                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
-                    fullContent += parsed.choices[0].delta.content || '';
-                  }
-                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) {
-                    finishReason = parsed.choices[0].finish_reason;
-                  }
+                  responseId = parsed.id || responseId; rModel = parsed.model || rModel;
+                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) fullContent += parsed.choices[0].delta.content || '';
+                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) finishReason = parsed.choices[0].finish_reason;
                 } catch (pe) {}
               }
             }
@@ -405,34 +307,19 @@ export async function handleProxy(req, res) {
         } catch (bufErr) {}
 
         res.setHeader('content-type', 'application/json');
-        res.json({
-          id: responseId || 'chatcmpl-' + Date.now(),
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: prefix + ':' + rModel,
-          choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: finishReason }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        });
+        res.json({ id: responseId || 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: prefix + ':' + rModel, choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: finishReason }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
         recordProxyRequest(prefix, ip, upstream.status >= 400);
         return;
       }
 
-      // ── NON-SSE RESPONSE ──────────────────────────────────
+      // ── NON-SSE RESPONSE ──
       var responseBody = await upstream.text();
 
-      // Translate non-stream responses for known formats
       if (responseFormat === 'gemini') {
         var gText = parseGeminiFull(responseBody);
         if (gText !== null) {
           res.setHeader('content-type', 'application/json');
-          res.json({
-            id: 'chatcmpl-' + Date.now(),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: prefix + ':' + strippedModel,
-            choices: [{ index: 0, message: { role: 'assistant', content: gText }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          });
+          res.json({ id: 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: prefix + ':' + strippedModel, choices: [{ index: 0, message: { role: 'assistant', content: gText }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
           recordProxyRequest(prefix, ip, upstream.status >= 400);
           return;
         }
@@ -444,68 +331,34 @@ export async function handleProxy(req, res) {
           res.setHeader('content-type', 'application/json');
           try {
             var aResp = JSON.parse(responseBody);
-            res.json({
-              id: aResp.id || 'chatcmpl-' + Date.now(),
-              object: 'chat.completion',
-              created: Math.floor(Date.now() / 1000),
-              model: prefix + ':' + strippedModel,
-              choices: [{ index: 0, message: { role: 'assistant', content: aText }, finish_reason: 'stop' }],
-              usage: {
-                prompt_tokens: (aResp.usage && aResp.usage.input_tokens) || 0,
-                completion_tokens: (aResp.usage && aResp.usage.output_tokens) || 0,
-                total_tokens: ((aResp.usage && aResp.usage.input_tokens) || 0) + ((aResp.usage && aResp.usage.output_tokens) || 0),
-              },
-            });
-          } catch (e) {
-            res.json({
-              id: 'chatcmpl-' + Date.now(),
-              object: 'chat.completion',
-              created: Math.floor(Date.now() / 1000),
-              model: prefix + ':' + strippedModel,
-              choices: [{ index: 0, message: { role: 'assistant', content: aText }, finish_reason: 'stop' }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            });
-          }
+            res.json({ id: aResp.id || 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: prefix + ':' + strippedModel, choices: [{ index: 0, message: { role: 'assistant', content: aText }, finish_reason: 'stop' }], usage: { prompt_tokens: (aResp.usage && aResp.usage.input_tokens) || 0, completion_tokens: (aResp.usage && aResp.usage.output_tokens) || 0, total_tokens: ((aResp.usage && aResp.usage.input_tokens) || 0) + ((aResp.usage && aResp.usage.output_tokens) || 0) } });
+          } catch (e) { res.json({ id: 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: prefix + ':' + strippedModel, choices: [{ index: 0, message: { role: 'assistant', content: aText }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }); }
           recordProxyRequest(prefix, ip, upstream.status >= 400);
           return;
         }
       }
 
       if (responseFormat === 'custom' && customParser) {
-        // For non-SSE custom, try parsing the whole body as one chunk
         var customText = customParser(responseBody, 'full');
         if (customText) {
           res.setHeader('content-type', 'application/json');
-          res.json({
-            id: 'chatcmpl-' + Date.now(),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: prefix + ':' + strippedModel,
-            choices: [{ index: 0, message: { role: 'assistant', content: customText }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          });
+          res.json({ id: 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: prefix + ':' + strippedModel, choices: [{ index: 0, message: { role: 'assistant', content: customText }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
           recordProxyRequest(prefix, ip, upstream.status >= 400);
           return;
         }
       }
 
-      // Default passthrough
       res.send(responseBody);
       recordProxyRequest(prefix, ip, upstream.status >= 400);
       return;
 
-    } catch (fetchErr) {
+    } catch (err) {
       skipped.add(index);
-      lastError = fetchErr.message;
+      lastError = err.message;
       continue;
     }
   }
 
   recordProxyRequest(prefix, ip, true);
-  res.status(502).json({
-    error: {
-      message: 'All ' + providerKeys.length + ' key(s) for "' + prefix + '" failed. Last error: ' + lastError,
-      type: 'proxy_error',
-    }
-  });
+  res.status(502).json({ error: { message: 'All ' + providerKeys.length + ' key(s) for "' + prefix + '" failed. Last error: ' + lastError, type: 'proxy_error' } });
 }
