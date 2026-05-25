@@ -5,6 +5,15 @@ import { parseCompoundKeys, getNextKey } from './keyManager.js';
 import { transformRequest, injectKey } from './transformer.js';
 import { recordProxyRequest } from './stats.js';
 
+// ── PROXY AGENT CACHE (Prevents Socket Exhaustion/Memory Leaks) ──
+const proxyAgentCache = new Map();
+function getProxyAgent(url) {
+  if (!proxyAgentCache.has(url)) {
+    proxyAgentCache.set(url, new ProxyAgent(url));
+  }
+  return proxyAgentCache.get(url);
+}
+
 // ── BUILT-IN CHUNK PARSERS ──────────────────────────────────
 function parseGeminiChunk(data) {
   try {
@@ -90,33 +99,26 @@ function compileCustomParser(parserStr) {
 // ── MAIN PROXY HANDLER ──────────────────────────────────────
 export async function handleProxy(req, res) {
   var ip = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.socket ? req.socket.remoteAddress : 'unknown') || 'unknown';
-
   var body = req.body || {};
   var modelRaw = body.model || '';
   var colonIdx = modelRaw.indexOf(':');
-
   if (!modelRaw || colonIdx === -1) {
     recordProxyRequest(null, ip, true);
     return res.status(400).json({ error: { message: 'Model field must include a provider prefix, e.g. "opn:gpt-4o"', type: 'proxy_error' }});
   }
-
   var prefix = modelRaw.slice(0, colonIdx).toLowerCase();
   var strippedModel = modelRaw.slice(colonIdx + 1);
-
   var provider = getProvider(prefix);
   if (!provider) {
     recordProxyRequest(prefix, ip, true);
     return res.status(404).json({ error: { message: 'No provider registered with prefix "' + prefix + '".', type: 'proxy_error' }});
   }
-
   var authHeader = req.headers['authorization'] || '';
   var allKeys = parseCompoundKeys(authHeader);
   var providerKeys = allKeys[prefix] || [];
-
   if (providerKeys.length === 0 && provider.optional_key) {
     providerKeys.push(provider.optional_key);
   }
-
   if (providerKeys.length === 0) {
     recordProxyRequest(prefix, ip, true);
     return res.status(401).json({ error: { message: 'No API keys for prefix "' + prefix + '". Send keys as: Authorization: Bearer ' + prefix + '=key1,key2', type: 'auth_error' }});
@@ -125,7 +127,6 @@ export async function handleProxy(req, res) {
   var transformed = transformRequest(body, provider, strippedModel, req.path, req.headers, req.method);
   var clientWantsStream = body.stream === true;
   var responseFormat = (transformed.response_format || 'openai').toLowerCase();
-
   var customStreamContentType = transformed.stream_content_type || null;
   var extraRetryCodes = transformed.retry_codes || [];
   var customTimeout = transformed.timeout || 300000;
@@ -147,15 +148,14 @@ export async function handleProxy(req, res) {
   while (true) {
     var picked = getNextKey(prefix, providerKeys, skipped);
     if (!picked) break;
-
     var key = picked.key;
     var index = picked.index;
     var headers = injectKey(transformed.headers, key);
-
+    
     var upstreamUrl;
     if (transformed.url) upstreamUrl = transformed.url.replace(/{{KEY}}/g, key);
     else upstreamUrl = provider.upstream_url + transformed.url_path;
-
+    
     var httpMethod = transformed.method || (req.method === 'GET' ? 'GET' : (req.method || 'POST'));
 
     try {
@@ -164,24 +164,22 @@ export async function handleProxy(req, res) {
         headers: headers,
         signal: AbortSignal.timeout(customTimeout),
       };
-
       if (httpMethod !== 'GET' && httpMethod !== 'HEAD') {
         fetchOpts.body = JSON.stringify(transformed.body);
       }
 
-      // ── INJECT PROXY AGENT IF KEY HAS FORWARD PROXY ──
+      // ── INJECT CACHED PROXY AGENT IF KEY HAS FORWARD PROXY ──
       if (picked.proxyUrl) {
-        fetchOpts.dispatcher = new ProxyAgent(picked.proxyUrl);
+        fetchOpts.dispatcher = getProxyAgent(picked.proxyUrl);
         console.log('[proxy] routing through forward proxy for key index ' + index);
       }
 
-      var upstream = await undiciFetch(upstreamUrl, fetchOpts);
+      var upstream = await undici_fetch(upstreamUrl, fetchOpts);
 
       var retryCodes = [401, 403, 429];
       for (var rc = 0; rc < extraRetryCodes.length; rc++) {
-        if (retryCodes.indexOf(extraRetryCodes[rc]) === -1) retryCodes.push(Number(extraRetryCodes[rc]));
+        if (retryCodes.indexOf(Number(extraRetryCodes[rc])) === -1) retryCodes.push(Number(extraRetryCodes[rc]));
       }
-
       if (retryCodes.indexOf(upstream.status) !== -1) {
         skipped.add(index);
         lastError = 'Key #' + (index + 1) + ' returned ' + upstream.status;
@@ -198,7 +196,6 @@ export async function handleProxy(req, res) {
         if (['transfer-encoding', 'connection', 'keep-alive', 'content-encoding'].indexOf(lower) !== -1) continue;
         res.setHeader(hk, hv);
       }
-
       res.status(upstream.status);
 
       // ── RAW MODE ──
@@ -228,26 +225,21 @@ export async function handleProxy(req, res) {
         res.setHeader('content-type', 'text/event-stream');
         res.setHeader('cache-control', 'no-cache');
         res.setHeader('connection', 'keep-alive');
-
         var reader = upstream.body.getReader();
         var decoder = new TextDecoder();
         var streamBuffer = '';
         var streamId = 'chatcmpl-' + Date.now();
         var fullModel = prefix + ':' + strippedModel;
         var sentDone = false;
-
         try {
           while (true) {
             var chunk = await reader.read();
             if (chunk.done) break;
-
             var textChunk = decoder.decode(chunk.value, { stream: true });
             if (responseFormat === 'openai') { res.write(textChunk); continue; }
-
             streamBuffer += textChunk;
             var lines = streamBuffer.split('\n');
             streamBuffer = lines.pop() || '';
-
             var currentEventType = '';
             for (var li = 0; li < lines.length; li++) {
               var line = lines[li].trim();
@@ -255,7 +247,6 @@ export async function handleProxy(req, res) {
               if (line.indexOf('data: ') !== 0) continue;
               var dataStr = line.slice(6).trim();
               if (dataStr === '[DONE]') { res.write('data: [DONE]\n\n'); sentDone = true; continue; }
-
               var extractedText = chunkParser ? chunkParser(dataStr, currentEventType) : null;
               if (extractedText) {
                 var openaiChunk = { id: streamId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: fullModel, choices: [{ index: 0, delta: { content: extractedText }, finish_reason: null }] };
@@ -274,7 +265,6 @@ export async function handleProxy(req, res) {
         var reader2 = upstream.body.getReader();
         var decoder2 = new TextDecoder();
         var fullContent = '', rModel = strippedModel, finishReason = 'stop', responseId = '', currentEventType2 = '';
-
         try {
           var buffer2 = '';
           while (true) {
@@ -283,14 +273,12 @@ export async function handleProxy(req, res) {
             buffer2 += decoder2.decode(chunk2.value, { stream: true });
             var lines2 = buffer2.split('\n');
             buffer2 = lines2.pop() || '';
-
             for (var li2 = 0; li2 < lines2.length; li2++) {
               var line2 = lines2[li2].trim();
               if (line2.indexOf('event: ') === 0) { currentEventType2 = line2.slice(7).trim(); continue; }
               if (line2.indexOf('data: ') !== 0) continue;
               var data2 = line2.slice(6).trim();
               if (data2 === '[DONE]') continue;
-
               if (chunkParser) {
                 var extracted = chunkParser(data2, currentEventType2);
                 if (extracted) fullContent += extracted;
@@ -305,7 +293,6 @@ export async function handleProxy(req, res) {
             }
           }
         } catch (bufErr) {}
-
         res.setHeader('content-type', 'application/json');
         res.json({ id: responseId || 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: prefix + ':' + rModel, choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: finishReason }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
         recordProxyRequest(prefix, ip, upstream.status >= 400);
@@ -314,7 +301,6 @@ export async function handleProxy(req, res) {
 
       // ── NON-SSE RESPONSE ──
       var responseBody = await upstream.text();
-
       if (responseFormat === 'gemini') {
         var gText = parseGeminiFull(responseBody);
         if (gText !== null) {
@@ -324,7 +310,6 @@ export async function handleProxy(req, res) {
           return;
         }
       }
-
       if (responseFormat === 'anthropic') {
         var aText = parseAnthropicFull(responseBody);
         if (aText !== null) {
@@ -337,7 +322,6 @@ export async function handleProxy(req, res) {
           return;
         }
       }
-
       if (responseFormat === 'custom' && customParser) {
         var customText = customParser(responseBody, 'full');
         if (customText) {
@@ -347,7 +331,7 @@ export async function handleProxy(req, res) {
           return;
         }
       }
-
+      
       res.send(responseBody);
       recordProxyRequest(prefix, ip, upstream.status >= 400);
       return;
@@ -358,7 +342,7 @@ export async function handleProxy(req, res) {
       continue;
     }
   }
-
+  
   recordProxyRequest(prefix, ip, true);
   res.status(502).json({ error: { message: 'All ' + providerKeys.length + ' key(s) for "' + prefix + '" failed. Last error: ' + lastError, type: 'proxy_error' } });
 }
